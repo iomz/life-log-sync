@@ -6,24 +6,31 @@ Scripts for syncing personal activity data.
 
 `scripts/strava_sync.py` reads recent activities from Strava.
 
-Create `.env.local` with Strava OAuth credentials:
+Install dependencies:
 
 ```sh
-STRAVA_CLIENT_ID="..."
-STRAVA_CLIENT_SECRET="..."
-STRAVA_REFRESH_TOKEN="..."
+python3 -m pip install -r requirements.txt
 ```
 
-The script refreshes `STRAVA_ACCESS_TOKEN` automatically at startup and writes
-the latest `STRAVA_ACCESS_TOKEN`, `STRAVA_REFRESH_TOKEN`, and
-`STRAVA_EXPIRES_AT` back to `.env.local`.
+Create `config.toml` from the example and add your Strava OAuth credentials:
+
+```sh
+cp config.example.toml config.toml
+```
+
+Never commit `config.toml`. It contains OAuth credentials and refreshed tokens
+that can access your Strava data. The repository ignores this file by default.
+
+The script refreshes the Strava access token automatically at startup and
+writes the latest `access_token`, `refresh_token`, and `expires_at` back to
+`config.toml`.
 
 The authorization must include Strava's `activity:read` scope. A token that can
 read `/athlete` is not enough for `/athlete/activities`; Strava returns
 `activity:read_permission` as missing when that scope is absent.
 
-For one-off use, you can still provide `STRAVA_ACCESS_TOKEN` in the environment
-when refresh credentials are not configured.
+For one-off use, you can set `strava.access_token` in `config.toml` when
+refresh credentials are not configured.
 
 Run:
 

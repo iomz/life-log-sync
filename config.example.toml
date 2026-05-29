@@ -13,9 +13,22 @@ refresh_token = ""
 access_token = ""
 expires_at = 0
 
+[withings]
+client_id = ""
+client_secret = ""
+refresh_token = ""
+
+# Optional fallback for one-off runs when refresh_token is not configured.
+access_token = ""
+expires_at = 0
+
 [sync.strava]
 # Number of recent days to fetch from Strava.
 days = 30
 
 # Maximum number of activities to request per sync run.
 per_page = 100
+
+[sync.withings]
+# Number of recent days to fetch from Withings.
+days = 30

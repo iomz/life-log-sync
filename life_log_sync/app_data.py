@@ -81,6 +81,13 @@ def write_csv_file(path: Path | str, rows: Iterable[dict[str, Any]], fieldnames:
     return path
 
 
+def write_text_file(path: Path | str, content: str) -> Path:
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(path, content)
+    return path
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,18 @@ class StravaConfig:
 
 
 @dataclass(frozen=True)
+class WithingsConfig:
+    client_id: str
+    client_secret: str
+    refresh_token: str
+    access_token: str
+    expires_at: int
+    measures_csv: Path
+    raw_dir: Path
+    days: int
+
+
+@dataclass(frozen=True)
 class AppConfig:
     path: Path
     data: dict[str, Any]
@@ -35,6 +48,7 @@ class AppConfig:
     generated_dir: Path
     today_context_path: Path
     strava: StravaConfig
+    withings: WithingsConfig
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -54,6 +68,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     generated_dir = _configured_data_path(data_dir, data.get("generated", {}), "generated.dir", Path("generated"))
     today_context_path = generated_dir / "today_context.md"
     strava = _load_strava_config(data, data_dir)
+    withings = _load_withings_config(data, data_dir)
     return AppConfig(
         path=config_path,
         data=data,
@@ -61,6 +76,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         generated_dir=generated_dir,
         today_context_path=today_context_path,
         strava=strava,
+        withings=withings,
     )
 
 
@@ -74,6 +90,19 @@ def update_strava_tokens(config: AppConfig, token: dict[str, Any]) -> None:
     strava["refresh_token"] = _required_token_value(token, "refresh_token")
     if "expires_at" in token:
         strava["expires_at"] = token["expires_at"]
+    save_config(config)
+
+
+def update_withings_tokens(config: AppConfig, token: dict[str, Any]) -> None:
+    withings = config.data.setdefault("withings", {})
+    withings["access_token"] = _required_token_value(token, "access_token", "Withings")
+    refresh_token = str(token.get("refresh_token", "")).strip()
+    if refresh_token:
+        withings["refresh_token"] = refresh_token
+    if "expires_in" in token:
+        withings["expires_at"] = int(token["expires_in"]) + int(time.time())
+    if "expires_at" in token:
+        withings["expires_at"] = token["expires_at"]
     save_config(config)
 
 
@@ -151,6 +180,26 @@ def _load_strava_config(data: dict[str, Any], data_dir: Path) -> StravaConfig:
     )
 
 
+def _load_withings_config(data: dict[str, Any], data_dir: Path) -> WithingsConfig:
+    withings = data.get("withings", {})
+    sync = _withings_sync_section(data)
+    return WithingsConfig(
+        client_id=str(withings.get("client_id", "")).strip(),
+        client_secret=str(withings.get("client_secret") or withings.get("secret") or "").strip(),
+        refresh_token=str(withings.get("refresh_token", "")).strip(),
+        access_token=str(withings.get("access_token", "")).strip(),
+        expires_at=_int_value(withings.get("expires_at", 0), "withings.expires_at"),
+        measures_csv=_configured_data_path(
+            data_dir,
+            withings,
+            "withings.measures_csv",
+            Path("withings/body_measures.csv"),
+        ),
+        raw_dir=_configured_data_path(data_dir, withings, "withings.raw_dir", Path("withings/raw")),
+        days=_positive_int(sync.get("days", 30), "sync.withings.days"),
+    )
+
+
 def _configured_data_path(data_dir: Path, section: dict[str, Any], name: str, default: Path) -> Path:
     key = name.rsplit(".", maxsplit=1)[-1]
     raw_path = str(section.get(key, "")).strip()
@@ -167,10 +216,17 @@ def _strava_sync_section(data: dict[str, Any]) -> dict[str, Any]:
     return sync
 
 
-def _required_token_value(token: dict[str, Any], key: str) -> str:
+def _withings_sync_section(data: dict[str, Any]) -> dict[str, Any]:
+    sync = data.get("sync", {})
+    if isinstance(sync.get("withings"), dict):
+        return sync["withings"]
+    return sync
+
+
+def _required_token_value(token: dict[str, Any], key: str, service: str = "Strava") -> str:
     value = str(token.get(key, "")).strip()
     if not value:
-        raise SystemExit(f"Strava token refresh response did not include {key}.")
+        raise SystemExit(f"{service} token refresh response did not include {key}.")
     return value
 
 

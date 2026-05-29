@@ -63,8 +63,23 @@ ${XDG_DATA_HOME:-~/.local/share}/life-log-sync/
 │   │   └── <activity-id>.json
 │   └── activities.csv
 ├── withings/
+│   ├── raw/
+│   │   └── body_measures.json
+│   └── body_measures.csv
 └── generated/
     └── today_context.md
+```
+
+Generate today's context from synced data:
+
+```sh
+life-log-sync context today
+```
+
+For a specific date:
+
+```sh
+life-log-sync context today --date 2026-05-29
 ```
 
 ## Installation
@@ -137,4 +152,19 @@ Without installing the console command, run through Poetry:
 
 ```sh
 poetry run life-log-sync strava sync
+```
+
+## Withings
+
+The Withings sync reads recent body measurements and writes both raw JSON and a
+normalized CSV into the application data directory.
+
+Withings requires OAuth user tokens. `client_id` and `client_secret` identify
+the app, but user data access requires `withings.refresh_token` or
+`withings.access_token` in the config file.
+
+Run:
+
+```sh
+life-log-sync withings sync
 ```

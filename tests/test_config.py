@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from life_log_sync.config import load_config, render_toml, update_strava_tokens
+from life_log_sync.config import load_config, render_toml, update_strava_tokens, update_withings_tokens
 
 
 class ConfigTest(unittest.TestCase):
@@ -23,9 +23,16 @@ client_id = "client"
 client_secret = "secret"
 refresh_token = "refresh"
 
+[withings]
+client_id = "withings-client"
+secret = "withings-secret"
+
 [sync.strava]
 days = 14
 per_page = 50
+
+[sync.withings]
+days = 21
 """.strip(),
                 encoding="utf-8",
             )
@@ -39,6 +46,11 @@ per_page = 50
             self.assertEqual(config.strava.client_id, "client")
             self.assertEqual(config.strava.days, 14)
             self.assertEqual(config.strava.per_page, 50)
+            self.assertEqual(config.withings.client_id, "withings-client")
+            self.assertEqual(config.withings.client_secret, "withings-secret")
+            self.assertEqual(config.withings.measures_csv, root / "app-data/withings/body_measures.csv")
+            self.assertEqual(config.withings.raw_dir, root / "app-data/withings/raw")
+            self.assertEqual(config.withings.days, 21)
 
     def test_loads_flat_sync_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -107,6 +119,46 @@ refresh_token = "old"
             self.assertEqual(updated.strava.access_token, "new-access")
             self.assertEqual(updated.strava.refresh_token, "new-refresh")
             self.assertEqual(updated.strava.expires_at, 123)
+
+    def test_updates_withings_tokens_and_rotates_refresh_token_when_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "life-log-sync.toml"
+            config_path.write_text(
+                """
+[withings]
+refresh_token = "old-refresh"
+""".strip(),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_withings_tokens(
+                config,
+                {"access_token": "new-access", "refresh_token": "new-refresh", "expires_at": 123},
+            )
+
+            updated = load_config(config_path)
+            self.assertEqual(updated.withings.access_token, "new-access")
+            self.assertEqual(updated.withings.refresh_token, "new-refresh")
+            self.assertEqual(updated.withings.expires_at, 123)
+
+    def test_preserves_withings_refresh_token_when_refresh_response_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "life-log-sync.toml"
+            config_path.write_text(
+                """
+[withings]
+refresh_token = "old-refresh"
+""".strip(),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_withings_tokens(config, {"access_token": "new-access", "expires_at": 123})
+
+            updated = load_config(config_path)
+            self.assertEqual(updated.withings.access_token, "new-access")
+            self.assertEqual(updated.withings.refresh_token, "old-refresh")
 
     def test_renders_nested_tables(self) -> None:
         rendered = render_toml({"sync": {"strava": {"days": 30}}})

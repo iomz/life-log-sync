@@ -6,3 +6,6 @@ dist/
 .env.local
 config.toml
 life-log-sync.toml
+
+.agents/
+skills-lock.json

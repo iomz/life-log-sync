@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlencode
 
 from ingest.app_data import write_csv_file, write_json_file
@@ -40,6 +40,12 @@ MEASURE_FIELDS = [
     "unit",
 ]
 
+ACTIVITY_FIELDS = [
+    "date",
+    "step_count",
+    "distance_km",
+]
+
 WORKOUT_FIELDS = [
     "source",
     "source_id",
@@ -47,6 +53,7 @@ WORKOUT_FIELDS = [
     "end_time",
     "duration_min",
     "distance_km",
+    "step_count",
     "activity_type",
     "raw_type",
 ]
@@ -60,6 +67,7 @@ WORKOUT_CATEGORIES = {
     7: "swim",
     8: "surf",
 }
+IGNORED_WORKOUT_CATEGORIES = {16}
 
 
 def sync(config: AppConfig) -> list[Path]:
@@ -71,12 +79,33 @@ def backfill(config: AppConfig, *, start_date: date, end_date: date | None = Non
     return sync_range(config, start_date, end_date or date.today(), raw_name="body_measures_backfill.json")
 
 
+def backfill_since_latest(config: AppConfig, *, end_date: date | None = None) -> list[Path]:
+    target_end_date = end_date or date.today()
+    latest_date = latest_local_date(config)
+    if latest_date is None:
+        return sync(config)
+    if latest_date > target_end_date:
+        return []
+    return sync_range(
+        config,
+        latest_date,
+        target_end_date,
+        raw_name="body_measures_incremental.json",
+    )
+
+
 def sync_range(config: AppConfig, start_date: date, end_date: date, *, raw_name: str) -> list[Path]:
     requests = _requests()
 
     with requests.Session() as session:
         access_token = get_access_token(session, config)
         measures = fetch_body_measures_windowed(session, access_token, start_date=start_date, end_date=end_date)
+        activity = fetch_activity_windowed(
+            session,
+            access_token,
+            start_date=start_date,
+            end_date=end_date,
+        )
         workouts = fetch_workouts_windowed_if_available(
             session,
             access_token,
@@ -85,6 +114,8 @@ def sync_range(config: AppConfig, start_date: date, end_date: date, *, raw_name:
         )
 
     written_paths = write_measures(config, measures, raw_name=raw_name, merge=True)
+    activity_raw_name = raw_name.replace("body_measures", "activity")
+    written_paths.extend(write_activity(config, activity, raw_name=activity_raw_name, merge=True))
     workout_raw_name = raw_name.replace("body_measures", "workouts")
     written_paths.extend(write_workouts(config, workouts, raw_name=workout_raw_name, merge=True))
     return written_paths
@@ -252,6 +283,53 @@ def fetch_workouts(
     return _withings_body(response, "Withings workouts request failed")
 
 
+def fetch_activity(
+    session: Any,
+    access_token: str,
+    *,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    try:
+        response = session.post(
+            WORKOUT_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            data={
+                "action": "getactivity",
+                "startdateymd": start_date.isoformat(),
+                "enddateymd": end_date.isoformat(),
+                "data_fields": "steps,distance",
+            },
+            timeout=TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        raise SystemExit(f"Could not reach Withings activity endpoint: {exc}") from exc
+    return _withings_body(response, "Withings activity request failed")
+
+
+def fetch_activity_windowed(
+    session: Any,
+    access_token: str,
+    *,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    if start_date > end_date:
+        raise SystemExit("Withings start date must be on or before end date.")
+
+    activities: list[dict[str, Any]] = []
+    window_start = start_date
+    while window_start <= end_date:
+        window_end = min(window_start + timedelta(days=BACKFILL_WINDOW_DAYS - 1), end_date)
+        body = fetch_activity(session, access_token, start_date=window_start, end_date=window_end)
+        window_activities = body.get("activities", [])
+        if not isinstance(window_activities, list):
+            raise SystemExit("Withings activity response did not contain activities.")
+        activities.extend(window_activities)
+        window_start = window_end + timedelta(days=1)
+    return {"activities": activities}
+
+
 def fetch_workouts_windowed(
     session: Any,
     access_token: str,
@@ -346,6 +424,26 @@ def write_workouts(
     return written_paths
 
 
+def write_activity(
+    config: AppConfig,
+    body: dict[str, Any],
+    *,
+    raw_name: str = "activity.json",
+    merge: bool = False,
+) -> list[Path]:
+    written_paths: list[Path] = []
+    activities = body.get("activities", [])
+    if not isinstance(activities, list):
+        raise SystemExit("Withings activity response did not contain activities.")
+
+    written_paths.append(write_json_file(config.withings.raw_dir / raw_name, body))
+    rows = normalize_activity_summaries(activities)
+    if merge:
+        rows = merge_activity_rows(read_activity_rows(config.withings.activity_csv), rows)
+    written_paths.append(write_csv_file(config.withings.activity_csv, rows, ACTIVITY_FIELDS))
+    return written_paths
+
+
 def read_measure_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -360,6 +458,38 @@ def read_workout_rows(path: Path) -> list[dict[str, Any]]:
 
     with path.open(encoding="utf-8", newline="") as csv_file:
         return list(csv.DictReader(csv_file))
+
+
+def read_activity_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    with path.open(encoding="utf-8", newline="") as csv_file:
+        return list(csv.DictReader(csv_file))
+
+
+def latest_local_date(config: AppConfig) -> date | None:
+    latest_dates = [
+        latest_measure_date(read_measure_rows(config.withings.measures_csv)),
+        latest_activity_date(read_activity_rows(config.withings.activity_csv)),
+        latest_workout_date(read_workout_rows(config.withings.workouts_csv)),
+    ]
+    present_dates = [value for value in latest_dates if value is not None]
+    if not present_dates:
+        return None
+    return min(present_dates)
+
+
+def latest_measure_date(rows: list[dict[str, Any]]) -> date | None:
+    return _latest_date(_date_from_iso(row.get("date")) for row in rows)
+
+
+def latest_workout_date(rows: list[dict[str, Any]]) -> date | None:
+    return _latest_date(_date_from_iso(str(row.get("start_time", "")).split("T", maxsplit=1)[0]) for row in rows)
+
+
+def latest_activity_date(rows: list[dict[str, Any]]) -> date | None:
+    return _latest_date(_date_from_iso(row.get("date")) for row in rows)
 
 
 def merge_measure_rows(
@@ -405,6 +535,16 @@ def merge_workout_rows(
     )
 
 
+def merge_activity_rows(
+    existing_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows_by_date: dict[str, dict[str, Any]] = {}
+    for row in [*existing_rows, *new_rows]:
+        rows_by_date[str(row.get("date", ""))] = row
+    return sorted(rows_by_date.values(), key=lambda row: str(row.get("date", "")))
+
+
 def normalize_measure_groups(measuregrps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for group in measuregrps:
@@ -427,6 +567,19 @@ def normalize_measure_groups(measuregrps: list[dict[str, Any]]) -> list[dict[str
     return rows
 
 
+def normalize_activity_summaries(activities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for activity in activities:
+        rows.append(
+            {
+                "date": str(activity.get("date", "")),
+                "step_count": str(activity.get("steps", "")),
+                "distance_km": _meters_to_km(activity.get("distance")),
+            }
+        )
+    return rows
+
+
 def normalize_workouts(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for workout in series:
@@ -436,6 +589,8 @@ def normalize_workouts(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(data, dict):
             data = {}
         category = _int_or_zero(workout.get("category"))
+        if category in IGNORED_WORKOUT_CATEGORIES:
+            continue
         rows.append(
             {
                 "source": "withings",
@@ -444,6 +599,7 @@ def normalize_workouts(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "end_time": datetime.fromtimestamp(end_timestamp).isoformat() if end_timestamp else "",
                 "duration_min": _workout_duration_min(workout, data, start_timestamp, end_timestamp),
                 "distance_km": _workout_distance_km(data),
+                "step_count": str(_int_or_zero(data.get("steps"))),
                 "activity_type": WORKOUT_CATEGORIES.get(category, f"category_{category}"),
                 "raw_type": WORKOUT_CATEGORIES.get(category, f"category_{category}"),
             }
@@ -465,6 +621,11 @@ def _workout_duration_min(
 
 def _workout_distance_km(data: dict[str, Any]) -> str:
     distance = _float_or_zero(data.get("manual_distance") or data.get("distance"))
+    return _meters_to_km(distance)
+
+
+def _meters_to_km(value: Any) -> str:
+    distance = _float_or_zero(value)
     return f"{distance / 1000:.2f}" if distance else ""
 
 
@@ -512,6 +673,22 @@ def _float_or_zero(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _latest_date(values: Iterable[date | None]) -> date | None:
+    dates = [value for value in values if value is not None]
+    if not dates:
+        return None
+    return max(dates)
+
+
+def _date_from_iso(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def _json_response(response: Any, error_message: str) -> Any:

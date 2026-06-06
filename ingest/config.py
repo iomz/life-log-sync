@@ -23,9 +23,19 @@ class WithingsConfig:
     access_token: str
     expires_at: int
     measures_csv: Path
+    activity_csv: Path
     workouts_csv: Path
     raw_dir: Path
     days: int
+
+
+@dataclass(frozen=True)
+class HevyConfig:
+    workouts_csv: Path
+    sets_csv: Path
+    raw_dir: Path
+    browser_dir: Path
+    login_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,7 @@ class AppConfig:
     generated_dir: Path
     daily_context_path: Path
     withings: WithingsConfig
+    hevy: HevyConfig
 
     @property
     def today_context_path(self) -> Path:
@@ -59,6 +70,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     generated_dir = _configured_data_path(data_dir, data.get("generated", {}), "generated.dir", Path("generated"))
     daily_context_path = generated_dir / "daily_context.md"
     withings = _load_withings_config(data, data_dir)
+    hevy = _load_hevy_config(data, data_dir)
     return AppConfig(
         path=config_path,
         data=data,
@@ -66,6 +78,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         generated_dir=generated_dir,
         daily_context_path=daily_context_path,
         withings=withings,
+        hevy=hevy,
     )
 
 
@@ -154,6 +167,12 @@ def _load_withings_config(data: dict[str, Any], data_dir: Path) -> WithingsConfi
             "withings.measures_csv",
             Path("withings/body_measures.csv"),
         ),
+        activity_csv=_configured_data_path(
+            data_dir,
+            withings,
+            "withings.activity_csv",
+            Path("withings/activity.csv"),
+        ),
         workouts_csv=_configured_data_path(
             data_dir,
             withings,
@@ -162,6 +181,25 @@ def _load_withings_config(data: dict[str, Any], data_dir: Path) -> WithingsConfi
         ),
         raw_dir=_configured_data_path(data_dir, withings, "withings.raw_dir", Path("withings/raw")),
         days=_positive_int(sync.get("days", 30), "sync.withings.days"),
+    )
+
+
+def _load_hevy_config(data: dict[str, Any], data_dir: Path) -> HevyConfig:
+    hevy = data.get("hevy", {})
+    return HevyConfig(
+        workouts_csv=_configured_data_path(
+            data_dir,
+            hevy,
+            "hevy.workouts_csv",
+            Path("hevy/workouts.csv"),
+        ),
+        sets_csv=_configured_data_path(data_dir, hevy, "hevy.sets_csv", Path("hevy/sets.csv")),
+        raw_dir=_configured_data_path(data_dir, hevy, "hevy.raw_dir", Path("hevy/raw")),
+        browser_dir=_configured_data_path(data_dir, hevy, "hevy.browser_dir", Path("hevy/browser")),
+        login_timeout_seconds=_positive_int(
+            hevy.get("login_timeout_seconds", 300),
+            "hevy.login_timeout_seconds",
+        ),
     )
 
 

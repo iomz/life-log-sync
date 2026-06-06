@@ -7,12 +7,8 @@ from pathlib import Path
 from ingest.config import AppConfig, load_config
 from ingest.context import (
     generate_daily_context,
-    measures_for_date,
-    read_withings_activities,
-    read_withings_measures,
-    withings_activities_for_date,
 )
-from ingest.sources import withings
+from ingest.sources import hevy, withings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,12 +22,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="source", required=True)
 
-    subparsers.add_parser("today", help="Gather data and render context for today.")
+    today_parser = subparsers.add_parser("today", help="Gather data and render context for today.")
+    _add_daily_sync_option(today_parser)
 
     day_parser = subparsers.add_parser("day", help="Gather data and render context for a date.")
     day_parser.add_argument("target_date", type=_date_arg, help="Target date in YYYY-MM-DD format.")
+    _add_daily_sync_option(day_parser)
 
-    subparsers.add_parser("yesterday", help="Gather data and render context for yesterday.")
+    yesterday_parser = subparsers.add_parser("yesterday", help="Gather data and render context for yesterday.")
+    _add_daily_sync_option(yesterday_parser)
 
     backfill_parser = subparsers.add_parser("backfill", help="Backfill historical data.")
     backfill_subparsers = backfill_parser.add_subparsers(dest="command", required=True)
@@ -52,7 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = subparsers.add_parser("sync", help="Run daily incremental sync.")
     sync_subparsers = sync_parser.add_subparsers(dest="command", required=True)
     sync_subparsers.add_parser("withings", help="Sync recent Withings measurements.")
+    sync_subparsers.add_parser("hevy", help="Sync Hevy workouts from CSV export.")
     sync_subparsers.add_parser("all", help="Sync recent data from all configured sources.")
+
+    import_parser = subparsers.add_parser("import", help="Import exported source data.")
+    import_subparsers = import_parser.add_subparsers(dest="command", required=True)
+    hevy_import_parser = import_subparsers.add_parser("hevy", help="Import Hevy workout CSV export.")
+    hevy_import_parser.add_argument("--csv", required=True, type=Path, help="Path to Hevy workout CSV export.")
 
     oauth_parser = subparsers.add_parser("oauth", help="OAuth helper commands.")
     oauth_subparsers = oauth_parser.add_subparsers(dest="service", required=True)
@@ -91,8 +96,20 @@ def main(argv: list[str] | None = None) -> int:
             print(path)
         return 0
 
+    if args.source == "sync" and args.command == "hevy":
+        written_paths = hevy.sync(config)
+        for path in written_paths:
+            print(path)
+        return 0
+
     if args.source == "sync" and args.command == "all":
-        written_paths = withings.sync(config)
+        written_paths = _sync_all(config)
+        for path in written_paths:
+            print(path)
+        return 0
+
+    if args.source == "import" and args.command == "hevy":
+        written_paths = hevy.import_workouts_csv(config, args.csv)
         for path in written_paths:
             print(path)
         return 0
@@ -107,12 +124,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.source == "today":
-        return _print_daily_context(config, date.today())
+        target = date.today()
+        _sync_for_daily_context(config, args.sync)
+        return _print_daily_context(config, target)
 
     if args.source == "day":
+        _sync_for_daily_context(config, args.sync)
         return _print_daily_context(config, args.target_date)
 
     if args.source == "yesterday":
+        _sync_for_daily_context(config, args.sync)
         return _print_daily_context(config, date.today() - timedelta(days=1))
 
     parser.error("Unsupported command.")
@@ -126,11 +147,24 @@ def _date_arg(value: str) -> date:
         raise argparse.ArgumentTypeError("date must be in YYYY-MM-DD format") from exc
 
 
+def _add_daily_sync_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Run `ingest sync all` before rendering context.",
+    )
+
+
+def _sync_for_daily_context(config: AppConfig, enabled: bool) -> None:
+    if enabled:
+        _sync_all(config)
+
+
+def _sync_all(config: AppConfig) -> list[Path]:
+    return [*withings.sync(config), *hevy.sync(config)]
+
+
 def _print_daily_context(config: AppConfig, target: date) -> int:
-    withings_measures = measures_for_date(read_withings_measures(config.withings.measures_csv), target)
-    withings_workouts = withings_activities_for_date(read_withings_activities(config.withings.workouts_csv), target)
-    if target == date.today() or not withings_measures or not withings_workouts:
-        withings.sync(config)
     path = generate_daily_context(config, target)
     print(path)
     print(path.read_text(encoding="utf-8"), end="")

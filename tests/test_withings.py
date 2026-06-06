@@ -6,17 +6,24 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 from ingest.config import load_config
 from ingest.sources.withings import (
     authorization_url,
+    backfill_since_latest,
+    fetch_activity_windowed,
     fetch_body_measures_windowed,
     fetch_workouts_windowed_if_available,
     fetch_workouts_windowed,
+    latest_local_date,
+    merge_activity_rows,
     merge_measure_rows,
     merge_workout_rows,
+    normalize_activity_summaries,
     normalize_measure_groups,
     normalize_workouts,
+    write_activity,
     write_measures,
     write_workouts,
 )
@@ -40,6 +47,8 @@ class FakeSession:
     def post(self, *args: object, **kwargs: object) -> FakeResponse:
         self.calls.append(kwargs)
         data = kwargs.get("data", {})
+        if isinstance(data, dict) and data.get("action") == "getactivity":
+            return FakeResponse({"activities": []})
         if isinstance(data, dict) and data.get("action") == "getworkouts":
             return FakeResponse({"series": []})
         return FakeResponse({"measuregrps": []})
@@ -114,7 +123,7 @@ client_id = "client-id"
                     "category": 7,
                     "startdate": 1780041600,
                     "enddate": 1780045200,
-                    "data": {"effduration": 3300, "manual_distance": 1000},
+                    "data": {"effduration": 3300, "manual_distance": 1000, "steps": 1234},
                 }
             ]
         )
@@ -124,6 +133,38 @@ client_id = "client-id"
         self.assertEqual(rows[0]["activity_type"], "swim")
         self.assertEqual(rows[0]["duration_min"], "55.00")
         self.assertEqual(rows[0]["distance_km"], "1.00")
+        self.assertEqual(rows[0]["step_count"], "1234")
+
+    def test_normalizes_activity_summaries(self) -> None:
+        rows = normalize_activity_summaries(
+            [
+                {
+                    "date": "2026-05-29",
+                    "steps": 3456,
+                    "distance": 2100,
+                }
+            ]
+        )
+
+        self.assertEqual(
+            rows,
+            [{"date": "2026-05-29", "step_count": "3456", "distance_km": "2.10"}],
+        )
+
+    def test_ignores_strength_training_category_duplicate(self) -> None:
+        rows = normalize_workouts(
+            [
+                {
+                    "id": 123,
+                    "category": 16,
+                    "startdate": 1780041600,
+                    "enddate": 1780045200,
+                    "data": {"effduration": 3600},
+                }
+            ]
+        )
+
+        self.assertEqual(rows, [])
 
     def test_writes_raw_json_and_csv_to_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -213,11 +254,45 @@ access_token = "access"
                     "end_time",
                     "duration_min",
                     "distance_km",
+                    "step_count",
                     "activity_type",
                     "raw_type",
                 ],
             )
             self.assertEqual(rows[0]["activity_type"], "walk")
+
+    def test_writes_raw_activity_json_and_csv_to_data_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{data_dir}"
+
+[withings]
+access_token = "access"
+""".strip(),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            written = write_activity(
+                config,
+                {"activities": [{"date": "2026-05-29", "steps": 3456, "distance": 2100}]},
+            )
+
+            raw_path = data_dir / "withings/raw/activity.json"
+            csv_path = data_dir / "withings/activity.csv"
+            self.assertIn(raw_path, written)
+            self.assertIn(csv_path, written)
+            self.assertEqual(json.loads(raw_path.read_text(encoding="utf-8"))["activities"][0]["steps"], 3456)
+            with csv_path.open(encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                rows = list(reader)
+            self.assertEqual(reader.fieldnames, ["date", "step_count", "distance_km"])
+            self.assertEqual(rows[0]["step_count"], "3456")
 
     def test_merges_measure_rows_idempotently(self) -> None:
         existing_rows = [
@@ -286,6 +361,117 @@ access_token = "access"
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["source_id"] for row in rows], ["123", "124"])
 
+    def test_merges_activity_rows_idempotently(self) -> None:
+        existing_rows = [{"date": "2026-05-29", "step_count": "1000"}]
+        new_rows = [
+            {"date": "2026-05-29", "step_count": "1200"},
+            {"date": "2026-05-30", "step_count": "1500"},
+        ]
+
+        rows = merge_activity_rows(existing_rows, new_rows)
+
+        self.assertEqual(
+            rows,
+            [
+                {"date": "2026-05-29", "step_count": "1200"},
+                {"date": "2026-05-30", "step_count": "1500"},
+            ],
+        )
+
+    def test_latest_local_date_uses_lagging_source_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
+            withings_dir = data_dir / "withings"
+            withings_dir.mkdir(parents=True)
+            (withings_dir / "body_measures.csv").write_text(
+                "\n".join(
+                    [
+                        "grpid,date,datetime_local,type,type_name,value,unit",
+                        "1,not-a-date,,1,weight,70.50,kg",
+                        "2,2026-06-02,2026-06-02T06:00:00,1,weight,70.40,kg",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (withings_dir / "workouts.csv").write_text(
+                "\n".join(
+                    [
+                        "source,source_id,start_time,end_time,duration_min,distance_km,activity_type,raw_type",
+                        "withings,1,2026-05-31T08:00:00,2026-05-31T08:30:00,30.00,1.00,walk,walk",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (withings_dir / "activity.csv").write_text(
+                "\n".join(
+                    [
+                        "date,step_count,distance_km",
+                        "2026-06-01,1200,1.00",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            self.assertEqual(latest_local_date(config), date(2026, 5, 31))
+
+    def test_backfill_since_latest_refreshes_from_latest_local_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
+            withings_dir = data_dir / "withings"
+            withings_dir.mkdir(parents=True)
+            (withings_dir / "body_measures.csv").write_text(
+                "\n".join(
+                    [
+                        "grpid,date,datetime_local,type,type_name,value,unit",
+                        "1,2026-06-02,2026-06-02T06:00:00,1,weight,70.50,kg",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (withings_dir / "workouts.csv").write_text(
+                "\n".join(
+                    [
+                        "source,source_id,start_time,end_time,duration_min,distance_km,activity_type,raw_type",
+                        "withings,1,2026-06-02T08:00:00,2026-06-02T08:30:00,30.00,1.00,walk,walk",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (withings_dir / "activity.csv").write_text(
+                "\n".join(
+                    [
+                        "date,step_count,distance_km",
+                        "2026-06-02,1200,1.00",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            with mock.patch("ingest.sources.withings.sync_range", return_value=[]) as sync_range:
+                written = backfill_since_latest(config, end_date=date(2026, 6, 5))
+
+            self.assertEqual(written, [])
+            sync_range.assert_called_once_with(
+                config,
+                date(2026, 6, 2),
+                date(2026, 6, 5),
+                raw_name="body_measures_incremental.json",
+            )
+
     def test_fetches_withings_backfill_in_date_windows(self) -> None:
         session = FakeSession()
 
@@ -297,6 +483,19 @@ access_token = "access"
         )
 
         self.assertEqual(body, {"measuregrps": []})
+        self.assertEqual(len(session.calls), 2)
+
+    def test_fetches_withings_activity_in_date_windows(self) -> None:
+        session = FakeSession()
+
+        body = fetch_activity_windowed(
+            session,
+            "access",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 4, 15),
+        )
+
+        self.assertEqual(body, {"activities": []})
         self.assertEqual(len(session.calls), 2)
 
     def test_fetches_withings_workouts_in_date_windows(self) -> None:

@@ -16,3 +16,12 @@ expires_at = 0
 [sync.withings]
 # Number of recent days to fetch from Withings.
 days = 30
+
+[hevy]
+# Optional. Normalized output path for `ingest import hevy --csv ...`.
+workouts_csv = "hevy/workouts.csv"
+sets_csv = "hevy/sets.csv"
+# Optional. Raw downloaded CSV exports and dedicated browser profile.
+raw_dir = "hevy/raw"
+browser_dir = "hevy/browser"
+login_timeout_seconds = 300

@@ -15,16 +15,26 @@ class NormalizedActivity:
     activity_type: str
     raw_type: str
     name: str = ""
+    notes: str = ""
+    step_count: int = 0
 
 
 def normalize_withings_activity(activity: dict[str, str]) -> NormalizedActivity:
+    return normalize_activity(activity, source="withings")
+
+
+def normalize_hevy_activity(activity: dict[str, str]) -> NormalizedActivity:
+    return normalize_activity(activity, source="hevy")
+
+
+def normalize_activity(activity: dict[str, str], *, source: str) -> NormalizedActivity:
     start_time = activity.get("start_time", "")
     duration_min = _float_value(activity.get("duration_min", ""))
     end_time = activity.get("end_time", "") or _end_time(start_time, duration_min)
     distance_km = _optional_float(activity.get("distance_km", ""))
     raw_type = activity.get("raw_type") or activity.get("activity_type") or "Unknown"
     return NormalizedActivity(
-        source="withings",
+        source=source,
         source_id=activity.get("source_id", "") or activity.get("id", "") or start_time,
         start_time=start_time,
         end_time=end_time,
@@ -33,6 +43,8 @@ def normalize_withings_activity(activity: dict[str, str]) -> NormalizedActivity:
         activity_type=canonical_activity_type(raw_type),
         raw_type=raw_type,
         name=activity.get("name", ""),
+        notes=activity.get("notes", "") or activity.get("description", ""),
+        step_count=_int_value(activity.get("step_count", "") or activity.get("steps", "")),
     )
 
 
@@ -46,6 +58,8 @@ def canonical_activity_type(raw_type: str) -> str:
         return "run"
     if value in {"ride", "bicycle", "cycling"}:
         return "ride"
+    if value in {"strength", "strength training", "weight training", "weights", "gym"}:
+        return "strength"
     return value or "unknown"
 
 
@@ -75,3 +89,10 @@ def _optional_float(value: str) -> float | None:
 
 def _float_value(value: str) -> float:
     return _optional_float(value) or 0.0
+
+
+def _int_value(value: str) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0

@@ -20,9 +20,9 @@ Sources
   -> Brain
 ```
 
-Current code fetches Withings data, writes local records, builds a `DailyState`,
-and renders AI-readable daily context. Future OpenAI API calls and Brain vault
-writes belong after rendered context.
+Current code fetches Withings data, imports Hevy workout exports, writes local
+records, builds a `DailyState`, and renders AI-readable daily context. Future
+OpenAI API calls and Brain vault writes belong after rendered context.
 
 ## Commands
 
@@ -48,9 +48,22 @@ Source maintenance:
 
 ```sh
 ingest sync withings
+ingest sync hevy
 ingest sync all
 ingest backfill withings --from 2024-01-01
 ```
+
+Hevy import from CSV export:
+
+```sh
+ingest import hevy --csv ~/Downloads/hevy-workouts.csv
+```
+
+The Hevy public API currently requires Hevy Pro. Without Pro, use the app export:
+Profile > Settings > Export & Import Data > Export Data > Export Workouts.
+`ingest sync hevy` automates that export with a dedicated Playwright browser
+profile stored under the application data directory. On the first run, log in to
+Hevy in the opened browser window, then rerun the command.
 
 Withings OAuth helpers:
 
@@ -103,6 +116,11 @@ ${XDG_DATA_HOME:-~/.local/share}/ingest/
 │   ├── raw/
 │   ├── body_measures.csv
 │   └── workouts.csv
+├── hevy/
+│   ├── browser/
+│   ├── raw/
+│   ├── workouts.csv
+│   └── sets.csv
 └── generated/
     └── daily_context.md
 ```

@@ -20,6 +20,7 @@ class DailyState:
     activities: list[NormalizedActivity]
     measures: list[dict[str, str]]
     withings_activity_summaries: list[dict[str, str]]
+    historical_withings_activity_summaries: list[dict[str, str]]
     historical_activities: list[NormalizedActivity]
     historical_measures: list[dict[str, str]]
     hevy_sets: list[dict[str, str]]
@@ -43,6 +44,18 @@ class ActivityMetrics:
     trend: str
 
 
+@dataclass(frozen=True)
+class ActivityEffortTotals:
+    non_swim_distance_km: float
+    duration_min: float
+    activity_count: int
+
+
+WALK_STEPS_PER_KM = 1300
+RUN_STEPS_PER_KM = 1200
+WALK_MIN_PER_KM = 12
+
+
 def generate_daily_context(config: AppConfig, target_date: date | None = None) -> Path:
     target = target_date or date.today()
     state = build_daily_state(config, target)
@@ -61,8 +74,9 @@ def build_daily_state(config: AppConfig, target_date: date) -> DailyState:
     hevy_sets = sets_for_date(read_hevy_sets(config.hevy.sets_csv), target_date)
     all_measures = read_withings_measures(config.withings.measures_csv)
     measures = measures_for_date(all_measures, target_date)
+    all_withings_activity_summaries = read_withings_activity_summaries(config.withings.activity_csv)
     withings_activity_summaries = withings_activity_summaries_for_date(
-        read_withings_activity_summaries(config.withings.activity_csv),
+        all_withings_activity_summaries,
         target_date,
     )
     return DailyState(
@@ -73,6 +87,7 @@ def build_daily_state(config: AppConfig, target_date: date) -> DailyState:
         ],
         measures=measures,
         withings_activity_summaries=withings_activity_summaries,
+        historical_withings_activity_summaries=all_withings_activity_summaries,
         historical_activities=[
             *_normalize_withings_activities(withings_activities),
             *_normalize_hevy_activities(hevy_activities),
@@ -162,15 +177,23 @@ def render_daily_context(
     historical_activities: list[dict[str, str]] | None = None,
     hevy_sets: list[dict[str, str]] | None = None,
     withings_activity_summaries: list[dict[str, str]] | None = None,
+    historical_withings_activity_summaries: list[dict[str, str]] | None = None,
 ) -> str:
     measures = measures or []
     historical_measures = historical_measures if historical_measures is not None else measures
     historical_activities = historical_activities if historical_activities is not None else activities
+    withings_activity_summaries = withings_activity_summaries or []
+    historical_withings_activity_summaries = (
+        historical_withings_activity_summaries
+        if historical_withings_activity_summaries is not None
+        else withings_activity_summaries
+    )
     state = DailyState(
         target_date=target_date,
         activities=_normalize_withings_activities(activities),
         measures=measures,
-        withings_activity_summaries=withings_activity_summaries or [],
+        withings_activity_summaries=withings_activity_summaries,
+        historical_withings_activity_summaries=historical_withings_activity_summaries,
         historical_activities=_normalize_withings_activities(historical_activities),
         historical_measures=historical_measures,
         hevy_sets=hevy_sets or [],
@@ -193,13 +216,12 @@ def _render_daily_state(state: DailyState) -> str:
     primary_today_activities = state.activities
     historical_normalized_activities = state.historical_activities
     measures = state.measures
-    total_distance_km = sum(
-        activity.distance_km or 0.0
-        for activity in primary_today_activities
-        if activity.activity_type != "swim"
-    )
-    total_duration_min = sum(activity.duration_min for activity in primary_today_activities)
     withings_steps = _withings_step_count(state.withings_activity_summaries)
+    activity_effort_totals = _activity_effort_totals(
+        primary_today_activities,
+        state.withings_activity_summaries,
+    )
+    logged_duration_min = sum(activity.duration_min for activity in primary_today_activities)
     withings_steps_text = _format_step_count(withings_steps)
     walking_distance_km = sum(
         activity.distance_km or 0.0
@@ -225,9 +247,9 @@ def _render_daily_state(state: DailyState) -> str:
     activity_metrics = _activity_metrics(
         primary_today_activities,
         historical_normalized_activities,
+        state.historical_withings_activity_summaries,
         target_date,
-        total_distance_km=total_distance_km,
-        total_duration_min=total_duration_min,
+        effort_totals=activity_effort_totals,
     )
     recovery_metrics = _recovery_metrics(
         primary_today_activities,
@@ -308,7 +330,7 @@ def _render_daily_state(state: DailyState) -> str:
             _ai_handoff(
                 activities=primary_today_activities,
                 activity_metrics=activity_metrics,
-                total_duration_min=total_duration_min,
+                total_duration_min=logged_duration_min,
                 withings_steps_text=withings_steps_text,
                 walking_distance_km=walking_distance_km,
                 swimming_duration_min=swimming_duration_min,
@@ -347,38 +369,96 @@ def _activity_level(total_distance_km: float, total_duration_min: float, activit
     return "High"
 
 
+def _activity_effort_totals(
+    activities: list[NormalizedActivity],
+    withings_activity_summaries: list[dict[str, str]],
+) -> ActivityEffortTotals:
+    logged_non_swim_distance_km = sum(
+        activity.distance_km or 0.0
+        for activity in activities
+        if activity.activity_type != "swim"
+    )
+    logged_duration_min = sum(activity.duration_min for activity in activities)
+    unlogged_steps = _unlogged_step_count(activities, withings_activity_summaries)
+    unlogged_step_distance_km = unlogged_steps / WALK_STEPS_PER_KM
+    unlogged_step_duration_min = unlogged_step_distance_km * WALK_MIN_PER_KM
+    return ActivityEffortTotals(
+        non_swim_distance_km=logged_non_swim_distance_km + unlogged_step_distance_km,
+        duration_min=logged_duration_min + unlogged_step_duration_min,
+        activity_count=len(activities) + (1 if unlogged_steps > 0 else 0),
+    )
+
+
+def _unlogged_step_count(
+    activities: list[NormalizedActivity],
+    withings_activity_summaries: list[dict[str, str]],
+) -> int:
+    total_steps = _withings_step_count(withings_activity_summaries)
+    if total_steps is None:
+        return 0
+    logged_steps = sum(_logged_step_equivalent(activity) for activity in activities)
+    return max(0, total_steps - logged_steps)
+
+
+def _logged_step_equivalent(activity: NormalizedActivity) -> int:
+    if activity.activity_type not in {"walk", "run"}:
+        return 0
+    if activity.step_count > 0:
+        return activity.step_count
+    if activity.distance_km is None:
+        return 0
+    steps_per_km = RUN_STEPS_PER_KM if activity.activity_type == "run" else WALK_STEPS_PER_KM
+    return round(activity.distance_km * steps_per_km)
+
+
 def _activity_metrics(
     activities: list[NormalizedActivity],
     historical_activities: list[NormalizedActivity],
+    historical_withings_activity_summaries: list[dict[str, str]],
     target_date: date,
     *,
-    total_distance_km: float,
-    total_duration_min: float,
+    effort_totals: ActivityEffortTotals,
 ) -> ActivityMetrics:
-    current_7d = _average_daily_activity_score(historical_activities, target_date, days=7)
-    previous_7d = _average_daily_activity_score(historical_activities, target_date - _date_delta(7), days=7)
-    avg_30d = _average_daily_activity_score(historical_activities, target_date, days=30)
+    current_7d = _average_daily_activity_score(
+        historical_activities,
+        historical_withings_activity_summaries,
+        target_date,
+        days=7,
+    )
+    previous_7d = _average_daily_activity_score(
+        historical_activities,
+        historical_withings_activity_summaries,
+        target_date - _date_delta(7),
+        days=7,
+    )
+    avg_30d = _average_daily_activity_score(
+        historical_activities,
+        historical_withings_activity_summaries,
+        target_date,
+        days=30,
+    )
     return ActivityMetrics(
-        label=_activity_level(total_distance_km, total_duration_min, len(activities)),
-        score=_activity_score_for_totals(total_distance_km, total_duration_min, len(activities)),
+        label=_activity_level(
+            effort_totals.non_swim_distance_km,
+            effort_totals.duration_min,
+            effort_totals.activity_count,
+        ),
+        score=_activity_score_for_totals(effort_totals),
         avg_7d=current_7d,
         avg_30d=avg_30d,
         trend=_activity_score_trend(current_7d, previous_7d),
     )
 
 
-def _activity_score_for_totals(
-    total_non_swim_distance_km: float,
-    total_duration_min: float,
-    activity_count: int,
-) -> float | None:
-    if activity_count == 0:
+def _activity_score_for_totals(effort_totals: ActivityEffortTotals) -> float | None:
+    if effort_totals.activity_count == 0:
         return None
-    return total_non_swim_distance_km + (total_duration_min / 12)
+    return effort_totals.non_swim_distance_km + (effort_totals.duration_min / 12)
 
 
 def _average_daily_activity_score(
     activities: list[NormalizedActivity],
+    withings_activity_summaries: list[dict[str, str]],
     end_date: date,
     *,
     days: int,
@@ -390,16 +470,34 @@ def _average_daily_activity_score(
         if (activity_date := _activity_date(activity.start_time)) is not None
         and start_date <= activity_date <= end_date
     ]
-    if not activities_in_window:
+    summaries_in_window = [
+        summary
+        for summary in withings_activity_summaries
+        if (summary_date := _summary_date(summary)) is not None
+        and start_date <= summary_date <= end_date
+    ]
+    if not activities_in_window and not summaries_in_window:
         return None
 
-    total_non_swim_distance_km = sum(
-        activity.distance_km or 0.0
-        for activity in activities_in_window
-        if activity.activity_type != "swim"
-    )
-    total_duration_min = sum(activity.duration_min for activity in activities_in_window)
-    return (total_non_swim_distance_km + (total_duration_min / 12)) / days
+    total_score = 0.0
+    for offset in range(days):
+        score_date = start_date + _date_delta(offset)
+        score = _activity_score_for_totals(
+            _activity_effort_totals(
+                [
+                    activity
+                    for activity in activities_in_window
+                    if _activity_date(activity.start_time) == score_date
+                ],
+                [
+                    summary
+                    for summary in summaries_in_window
+                    if _summary_date(summary) == score_date
+                ],
+            )
+        )
+        total_score += score or 0.0
+    return total_score / days
 
 
 def _format_activity_score(value: float | None) -> str:
@@ -828,6 +926,13 @@ def _measure_date(measure: dict[str, str]) -> date | None:
 def _activity_date(raw_value: str) -> date | None:
     try:
         return date.fromisoformat(raw_value[:10])
+    except ValueError:
+        return None
+
+
+def _summary_date(summary: dict[str, str]) -> date | None:
+    try:
+        return date.fromisoformat(summary.get("date", ""))
     except ValueError:
         return None
 

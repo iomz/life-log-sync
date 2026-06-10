@@ -546,6 +546,52 @@ class ContextTest(unittest.TestCase):
 
         self.assertIn("- Withings steps: 0", content)
 
+    def test_activity_score_uses_steps_when_no_workout_is_logged(self) -> None:
+        content = render_daily_context(
+            date(2026, 5, 29),
+            [],
+            withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6500"}],
+        )
+
+        self.assertIn("- Activity level: Light", content)
+        self.assertIn("- Activity score: 10.0", content)
+        self.assertIn("- Withings steps: 6500", content)
+
+    def test_activity_score_does_not_double_count_walk_steps(self) -> None:
+        content = render_daily_context(
+            date(2026, 5, 29),
+            [
+                {
+                    "start_time": "2026-05-29T12:30:00Z",
+                    "name": "Lunch Walk",
+                    "activity_type": "Walk",
+                    "distance_km": "5.00",
+                    "duration_min": "60.00",
+                    "step_count": "6500",
+                }
+            ],
+            withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6500"}],
+        )
+
+        self.assertIn("- Activity score: 10.0", content)
+
+    def test_activity_score_estimates_logged_run_steps_when_missing(self) -> None:
+        content = render_daily_context(
+            date(2026, 5, 29),
+            [
+                {
+                    "start_time": "2026-05-29T06:30:00Z",
+                    "name": "Morning Run",
+                    "activity_type": "Run",
+                    "distance_km": "5.00",
+                    "duration_min": "30.00",
+                }
+            ],
+            withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6000"}],
+        )
+
+        self.assertIn("- Activity score: 7.5", content)
+
     def test_handles_missing_withings_workouts_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

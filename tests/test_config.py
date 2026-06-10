@@ -60,6 +60,15 @@ days = 7
 
             self.assertEqual(config.withings.days, 7)
 
+    def test_defaults_withings_sync_days_to_thirty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ingest.toml"
+            config_path.write_text("", encoding="utf-8")
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.withings.days, 30)
+
     def test_uses_xdg_data_home_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "ingest.toml"

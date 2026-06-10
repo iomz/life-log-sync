@@ -15,7 +15,6 @@ MEASURE_URL = "https://wbsapi.withings.net/measure"
 WORKOUT_URL = "https://wbsapi.withings.net/v2/measure"
 TIMEOUT_SECONDS = 30
 BACKFILL_WINDOW_DAYS = 90
-DAILY_SYNC_DAYS = 7
 WITHINGS_SCOPES = "user.metrics,user.activity"
 
 BODY_MEASURE_TYPES = {
@@ -70,31 +69,43 @@ WORKOUT_CATEGORIES = {
 IGNORED_WORKOUT_CATEGORIES = {16}
 
 
-def sync(config: AppConfig) -> list[Path]:
-    today = date.today()
-    return sync_range(config, today - timedelta(days=DAILY_SYNC_DAYS - 1), today, raw_name="body_measures_recent.json")
+def sync(config: AppConfig, *, end_date: date | None = None) -> list[Path]:
+    target_end_date = end_date or date.today()
+    start_date = _sync_cursor_date(config, target_end_date)
+    if start_date > target_end_date:
+        return []
+    return sync_range(config, start_date, target_end_date, raw_name="body_measures_sync.json")
+
+
+def _sync_cursor_date(config: AppConfig, end_date: date) -> date:
+    latest_date = lagging_local_date(config)
+    if latest_date is None:
+        return end_date - timedelta(days=config.withings.days - 1)
+    return latest_date
 
 
 def backfill(config: AppConfig, *, start_date: date, end_date: date | None = None) -> list[Path]:
-    return sync_range(config, start_date, end_date or date.today(), raw_name="body_measures_backfill.json")
-
-
-def backfill_since_latest(config: AppConfig, *, end_date: date | None = None) -> list[Path]:
     target_end_date = end_date or date.today()
-    latest_date = latest_local_date(config)
-    if latest_date is None:
-        return sync(config)
-    if latest_date > target_end_date:
+    if start_date > target_end_date:
         return []
-    return sync_range(
-        config,
-        latest_date,
-        target_end_date,
-        raw_name="body_measures_incremental.json",
-    )
+    return sync_range(config, start_date, target_end_date, raw_name="body_measures_backfill.json")
+
+
+def lagging_local_date(config: AppConfig) -> date | None:
+    latest_dates = [
+        latest_measure_date(read_measure_rows(config.withings.measures_csv)),
+        latest_activity_date(read_activity_rows(config.withings.activity_csv)),
+        latest_workout_date(read_workout_rows(config.withings.workouts_csv)),
+    ]
+    present_dates = [value for value in latest_dates if value is not None]
+    if not present_dates:
+        return None
+    return min(present_dates)
 
 
 def sync_range(config: AppConfig, start_date: date, end_date: date, *, raw_name: str) -> list[Path]:
+    if start_date > end_date:
+        return []
     requests = _requests()
 
     with requests.Session() as session:
@@ -466,18 +477,6 @@ def read_activity_rows(path: Path) -> list[dict[str, Any]]:
 
     with path.open(encoding="utf-8", newline="") as csv_file:
         return list(csv.DictReader(csv_file))
-
-
-def latest_local_date(config: AppConfig) -> date | None:
-    latest_dates = [
-        latest_measure_date(read_measure_rows(config.withings.measures_csv)),
-        latest_activity_date(read_activity_rows(config.withings.activity_csv)),
-        latest_workout_date(read_workout_rows(config.withings.workouts_csv)),
-    ]
-    present_dates = [value for value in latest_dates if value is not None]
-    if not present_dates:
-        return None
-    return min(present_dates)
 
 
 def latest_measure_date(rows: list[dict[str, Any]]) -> date | None:

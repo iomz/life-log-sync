@@ -11,18 +11,18 @@ from unittest import mock
 from ingest.config import load_config
 from ingest.sources.withings import (
     authorization_url,
-    backfill_since_latest,
     fetch_activity_windowed,
     fetch_body_measures_windowed,
     fetch_workouts_windowed_if_available,
     fetch_workouts_windowed,
-    latest_local_date,
+    lagging_local_date,
     merge_activity_rows,
     merge_measure_rows,
     merge_workout_rows,
     normalize_activity_summaries,
     normalize_measure_groups,
     normalize_workouts,
+    sync,
     write_activity,
     write_measures,
     write_workouts,
@@ -74,6 +74,45 @@ class FakeResponseWithStatus(FakeResponse):
 
     def json(self) -> object:
         return {"status": self.status, "body": self.body, "error": self.error}
+
+
+def write_config(root: Path, extra: str = "") -> Path:
+    data_dir = root / "app-data"
+    config_path = root / "ingest.toml"
+    content = f'[app]\ndata_dir = "{data_dir}"\n'
+    if extra:
+        content = f"{content}\n{extra.strip()}\n"
+    config_path.write_text(content, encoding="utf-8")
+    return config_path
+
+
+def write_withings_csvs(
+    data_dir: Path,
+    *,
+    measures: list[str] | None = None,
+    workouts: list[str] | None = None,
+    activity: list[str] | None = None,
+) -> None:
+    withings_dir = data_dir / "withings"
+    withings_dir.mkdir(parents=True, exist_ok=True)
+    if measures is not None:
+        _write_csv_lines(
+            withings_dir / "body_measures.csv",
+            "grpid,date,datetime_local,type,type_name,value,unit",
+            measures,
+        )
+    if workouts is not None:
+        _write_csv_lines(
+            withings_dir / "workouts.csv",
+            "source,source_id,start_time,end_time,duration_min,distance_km,activity_type,raw_type",
+            workouts,
+        )
+    if activity is not None:
+        _write_csv_lines(withings_dir / "activity.csv", "date,step_count,distance_km", activity)
+
+
+def _write_csv_lines(path: Path, header: str, rows: list[str]) -> None:
+    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
 
 
 class WithingsTest(unittest.TestCase):
@@ -378,99 +417,82 @@ access_token = "access"
             ],
         )
 
-    def test_latest_local_date_uses_lagging_source_cursor(self) -> None:
+    def test_lagging_local_date_uses_oldest_source_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_dir = root / "app-data"
-            config_path = root / "ingest.toml"
-            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
-            withings_dir = data_dir / "withings"
-            withings_dir.mkdir(parents=True)
-            (withings_dir / "body_measures.csv").write_text(
-                "\n".join(
-                    [
-                        "grpid,date,datetime_local,type,type_name,value,unit",
-                        "1,not-a-date,,1,weight,70.50,kg",
-                        "2,2026-06-02,2026-06-02T06:00:00,1,weight,70.40,kg",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (withings_dir / "workouts.csv").write_text(
-                "\n".join(
-                    [
-                        "source,source_id,start_time,end_time,duration_min,distance_km,activity_type,raw_type",
-                        "withings,1,2026-05-31T08:00:00,2026-05-31T08:30:00,30.00,1.00,walk,walk",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (withings_dir / "activity.csv").write_text(
-                "\n".join(
-                    [
-                        "date,step_count,distance_km",
-                        "2026-06-01,1200,1.00",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            config_path = write_config(root)
+            write_withings_csvs(
+                data_dir,
+                measures=[
+                    "1,not-a-date,,1,weight,70.50,kg",
+                    "2,2026-06-02,2026-06-02T06:00:00,1,weight,70.40,kg",
+                ],
+                workouts=[
+                    "withings,1,2026-05-31T08:00:00,2026-05-31T08:30:00,30.00,1.00,walk,walk",
+                ],
+                activity=["2026-06-01,1200,1.00"],
             )
             config = load_config(config_path)
 
-            self.assertEqual(latest_local_date(config), date(2026, 5, 31))
+            self.assertEqual(lagging_local_date(config), date(2026, 5, 31))
 
-    def test_backfill_since_latest_refreshes_from_latest_local_date(self) -> None:
+    def test_sync_refreshes_from_lagging_local_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_dir = root / "app-data"
-            config_path = root / "ingest.toml"
-            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
-            withings_dir = data_dir / "withings"
-            withings_dir.mkdir(parents=True)
-            (withings_dir / "body_measures.csv").write_text(
-                "\n".join(
-                    [
-                        "grpid,date,datetime_local,type,type_name,value,unit",
-                        "1,2026-06-02,2026-06-02T06:00:00,1,weight,70.50,kg",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (withings_dir / "workouts.csv").write_text(
-                "\n".join(
-                    [
-                        "source,source_id,start_time,end_time,duration_min,distance_km,activity_type,raw_type",
-                        "withings,1,2026-06-02T08:00:00,2026-06-02T08:30:00,30.00,1.00,walk,walk",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (withings_dir / "activity.csv").write_text(
-                "\n".join(
-                    [
-                        "date,step_count,distance_km",
-                        "2026-06-02,1200,1.00",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            config_path = write_config(root)
+            write_withings_csvs(
+                data_dir,
+                measures=["1,2026-06-02,2026-06-02T06:00:00,1,weight,70.50,kg"],
+                workouts=[
+                    "withings,1,2026-06-02T08:00:00,2026-06-02T08:30:00,30.00,1.00,walk,walk",
+                ],
+                activity=["2026-06-02,1200,1.00"],
             )
             config = load_config(config_path)
 
             with mock.patch("ingest.sources.withings.sync_range", return_value=[]) as sync_range:
-                written = backfill_since_latest(config, end_date=date(2026, 6, 5))
+                written = sync(config, end_date=date(2026, 6, 5))
 
             self.assertEqual(written, [])
             sync_range.assert_called_once_with(
                 config,
                 date(2026, 6, 2),
                 date(2026, 6, 5),
-                raw_name="body_measures_incremental.json",
+                raw_name="body_measures_sync.json",
             )
+
+    def test_sync_uses_configured_recent_days_when_no_local_data_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = write_config(root, "[sync.withings]\ndays = 4")
+            config = load_config(config_path)
+
+            with mock.patch("ingest.sources.withings.sync_range", return_value=[]) as sync_range:
+                written = sync(config, end_date=date(2026, 6, 5))
+
+            self.assertEqual(written, [])
+            sync_range.assert_called_once_with(
+                config,
+                date(2026, 6, 2),
+                date(2026, 6, 5),
+                raw_name="body_measures_sync.json",
+            )
+
+    def test_sync_skips_when_local_data_is_newer_than_today(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = write_config(root)
+            write_withings_csvs(data_dir, activity=["2026-06-06,1200,1.00"])
+            config = load_config(config_path)
+
+            with mock.patch("ingest.sources.withings.sync_range", return_value=[]) as sync_range:
+                written = sync(config, end_date=date(2026, 6, 5))
+
+            self.assertEqual(written, [])
+            sync_range.assert_not_called()
 
     def test_fetches_withings_backfill_in_date_windows(self) -> None:
         session = FakeSession()

@@ -133,10 +133,10 @@ class CliTest(unittest.TestCase):
             withings_sync.assert_not_called()
             output = stdout.getvalue()
             context_path = data_dir / "generated/daily_context.md"
-            self.assertTrue(output.startswith(f"{context_path}\n"))
+            self.assertTrue(output.startswith("# Physical Context - 2026-05-29\n"))
             self.assertIn("# Physical Context - 2026-05-29", output)
             self.assertIn("walk: withings:1", output)
-            self.assertEqual(output, f"{context_path}\n{context_path.read_text(encoding='utf-8')}")
+            self.assertEqual(output, context_path.read_text(encoding="utf-8"))
 
     def test_ingest_day_does_not_sync_missing_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -384,14 +384,12 @@ class CliTest(unittest.TestCase):
             stdout = io.StringIO()
             with (
                 mock.patch("ingest.cli.date", fake_date),
-                mock.patch("ingest.cli.withings.backfill_since_latest") as withings_backfill,
                 mock.patch("ingest.cli.withings.sync") as withings_sync,
                 contextlib.redirect_stdout(stdout),
             ):
                 exit_code = main(["--config", str(config_path), "today"])
 
             self.assertEqual(exit_code, 0)
-            withings_backfill.assert_not_called()
             withings_sync.assert_not_called()
 
 

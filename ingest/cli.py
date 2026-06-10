@@ -166,7 +166,6 @@ def _sync_all(config: AppConfig) -> list[Path]:
 
 def _print_daily_context(config: AppConfig, target: date) -> int:
     path = generate_daily_context(config, target)
-    print(path)
     print(path.read_text(encoding="utf-8"), end="")
     return 0
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import csv
+import re
+import shutil
+import textwrap
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 from ingest.activities import (
     NormalizedActivity,
@@ -64,6 +68,177 @@ def generate_daily_context(config: AppConfig, target_date: date | None = None) -
 
 def generate_today_context(config: AppConfig, target_date: date | None = None) -> Path:
     return generate_daily_context(config, target_date)
+
+
+def render_daily_terminal_context(state: DailyState, console: Any | None = None) -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = console or Console()
+    target_date = state.target_date
+    activities = state.activities
+    withings_steps = _withings_step_count(state.withings_activity_summaries)
+    activity_effort_totals = _activity_effort_totals(activities, state.withings_activity_summaries)
+    logged_duration_min = sum(activity.duration_min for activity in activities)
+    withings_steps_text = _format_terminal_step_count(withings_steps)
+    walking_distance_km = sum(
+        activity.distance_km or 0.0
+        for activity in activities
+        if _is_walking_activity(activity)
+    )
+    swimming_duration_min = sum(
+        activity.duration_min
+        for activity in activities
+        if activity.activity_type == "swim"
+    )
+    strength_activities = [activity for activity in activities if activity.activity_type == "strength"]
+    strength_duration_min = sum(activity.duration_min for activity in strength_activities)
+    ride_distance_km = sum(
+        activity.distance_km or 0.0
+        for activity in activities
+        if activity.activity_type == "ride"
+    )
+    activity_metrics = _activity_metrics(
+        activities,
+        state.historical_activities,
+        state.historical_withings_activity_summaries,
+        target_date,
+        effort_totals=activity_effort_totals,
+    )
+    recovery_metrics = _recovery_metrics(
+        activities,
+        state.hevy_sets,
+        walking_distance_km=walking_distance_km,
+        swimming_duration_min=swimming_duration_min,
+    )
+    weight_metrics = _weight_metrics(state.historical_measures, target_date)
+    walking_metrics = _walking_metrics(state.historical_activities, target_date)
+    sources = _activity_sources(activities)
+
+    console.print(Text(f"Physical Context — {target_date.isoformat()}", style="bold"))
+    _render_section_title(console, "Daily Snapshot")
+    _render_kv_block(
+        console,
+        [
+            ("Activity", _snapshot_activity_status(activity_metrics, separator=" / ")),
+            ("Recovery", _snapshot_recovery_status(recovery_metrics, separator=" / ")),
+            (
+                "Movement",
+                _snapshot_movement_status(
+                    withings_steps,
+                    walking_distance_km,
+                    ride_distance_km,
+                    swimming_duration_min,
+                    formatted_steps=withings_steps_text,
+                    separator=" / ",
+                ),
+            ),
+            (
+                "Strength",
+                _snapshot_strength_status(
+                    strength_activities,
+                    state.hevy_sets,
+                    volume_formatter=_format_terminal_volume,
+                    separator=" / ",
+                ),
+            ),
+            ("Body", _snapshot_body_status(weight_metrics, separator=" / ")),
+        ],
+        indent=2,
+    )
+
+    _render_section_title(console, "Recovery")
+    _render_kv_block(
+        console,
+        [
+            ("Compatibility", recovery_metrics.compatibility),
+            ("Fatigue risk", recovery_metrics.fatigue_risk),
+            ("Recovery load score", f"{recovery_metrics.load_score:.1f}"),
+        ],
+        indent=2,
+    )
+    _render_subsection_title(console, "Primary drivers")
+    _render_bullets(console, [_format_terminal_driver(driver) for driver in recovery_metrics.drivers], indent=4)
+    _render_subsection_title(console, "Recovery flags")
+    _render_bullets(console, recovery_metrics.suggested_next_day, indent=4)
+
+    _render_section_title(console, "Trends")
+    trends = Table(box=None, show_edge=False, show_lines=False, expand=False, padding=(0, 2))
+    for column in ["  Metric", "Today", "7-day avg", "30-day avg", "Direction"]:
+        trends.add_column(column, style="bold white" if column.strip() == "Metric" else "", no_wrap=True)
+    trends.add_row(
+        _styled_terminal_value("  Activity score", label="Metric"),
+        _styled_terminal_value(_format_activity_score(activity_metrics.score)),
+        _styled_terminal_value(_format_average_activity_score(activity_metrics.avg_7d)),
+        _styled_terminal_value(_format_average_activity_score(activity_metrics.avg_30d)),
+        _styled_terminal_value(_terminal_trend_direction(activity_metrics.score, activity_metrics.avg_7d, activity_metrics.avg_30d)),
+    )
+    trends.add_row(
+        _styled_terminal_value("  Walking distance", label="Metric"),
+        _styled_terminal_value(f"{walking_distance_km:.2f} km"),
+        _styled_terminal_value(walking_metrics["avg_7d"]),
+        _styled_terminal_value(walking_metrics["avg_30d"]),
+        _styled_terminal_value(
+            _terminal_trend_direction(
+                walking_distance_km,
+                _walking_average_value(walking_metrics["avg_7d"]),
+                _walking_average_value(walking_metrics["avg_30d"]),
+            )
+        ),
+    )
+    trends.add_row(
+        _styled_terminal_value("  Weight", label="Metric"),
+        _styled_terminal_value(weight_metrics["current_weight"]),
+        _styled_terminal_value(weight_metrics["avg_7d"]),
+        _styled_terminal_value(weight_metrics["avg_30d"]),
+        _styled_terminal_value(
+            _terminal_trend_direction(
+                _weight_value(weight_metrics["current_weight"]),
+                _weight_value(weight_metrics["avg_7d"]),
+                _weight_value(weight_metrics["avg_30d"]),
+            )
+        ),
+    )
+    console.print(trends)
+
+    body_rows = _terminal_body_kv_rows(state.measures)
+    if body_rows:
+        _render_section_title(console, "Body")
+        _render_kv_block(console, body_rows, indent=2)
+
+    if activities:
+        _render_section_title(console, "Activities")
+        _render_terminal_activity_sections(console, activities, state.hevy_sets)
+
+    _render_section_title(console, "Data Coverage")
+    _render_kv_block(
+        console,
+        [
+            ("Sources", sources),
+            ("Activity count", str(len(activities))),
+            ("Missing data", _missing_data_summary(withings_steps, state.measures, activities)),
+        ],
+        indent=2,
+    )
+
+    _render_section_title(console, "Machine Handoff")
+    _render_wrapped_paragraph(
+        console,
+        _ai_handoff(
+            activities=activities,
+            activity_metrics=activity_metrics,
+            total_duration_min=logged_duration_min,
+            withings_steps_text=withings_steps_text,
+            walking_distance_km=walking_distance_km,
+            swimming_duration_min=swimming_duration_min,
+            strength_count=len(strength_activities),
+            strength_duration_min=strength_duration_min,
+            recovery_metrics=recovery_metrics,
+            walking_metrics=walking_metrics,
+            weight_metrics=weight_metrics,
+        ),
+    )
 
 
 def build_daily_state(config: AppConfig, target_date: date) -> DailyState:
@@ -228,11 +403,6 @@ def _render_daily_state(state: DailyState) -> str:
         for activity in primary_today_activities
         if _is_walking_activity(activity)
     )
-    walking_duration_min = sum(
-        activity.duration_min
-        for activity in primary_today_activities
-        if _is_walking_activity(activity)
-    )
     swimming_duration_min = sum(
         activity.duration_min
         for activity in primary_today_activities
@@ -260,72 +430,79 @@ def _render_daily_state(state: DailyState) -> str:
     weight_metrics = _weight_metrics(state.historical_measures, target_date)
     walking_metrics = _walking_metrics(historical_normalized_activities, target_date)
     sources = _activity_sources(primary_today_activities)
+    ride_distance_km = sum(
+        activity.distance_km or 0.0
+        for activity in primary_today_activities
+        if activity.activity_type == "ride"
+    )
+    body_rows = _body_rows(measures)
 
     lines = [
         f"# Physical Context - {target_date.isoformat()}",
         "",
-        "## Summary",
+        "## Daily Snapshot",
         "",
-        f"- Activity level: {activity_metrics.label}",
-        f"- Activity score: {_format_activity_score(activity_metrics.score)}",
-        f"- Activity trend: {activity_metrics.trend}",
-        f"- Recovery compatibility: {recovery_metrics.compatibility}",
-        f"- Withings steps: {withings_steps_text}",
+        "| Area | Status |",
+        "| --- | --- |",
+        f"| Activity | {_snapshot_activity_status(activity_metrics)} |",
+        f"| Recovery | {_snapshot_recovery_status(recovery_metrics)} |",
+        f"| Movement | {_snapshot_movement_status(withings_steps, walking_distance_km, ride_distance_km, swimming_duration_min)} |",
+        f"| Strength | {_snapshot_strength_status(strength_activities, state.hevy_sets)} |",
+        f"| Body | {_snapshot_body_status(weight_metrics)} |",
+        "",
+        "## Recovery",
+        "",
+        f"- Compatibility: {recovery_metrics.compatibility}",
+        f"- Fatigue risk: {recovery_metrics.fatigue_risk}",
+        f"- Recovery load score: {recovery_metrics.load_score:.1f}",
+        "- Primary drivers:",
+        *[f"  - {driver}" for driver in recovery_metrics.drivers],
+        "- Recovery Flags:",
+        *[f"  - {suggestion}" for suggestion in recovery_metrics.suggested_next_day],
+        "",
+        "## Trends",
+        "",
+        "| Metric | Today | 7-day avg | 30-day avg | Direction |",
+        "| --- | --- | --- | --- | --- |",
+        (
+            "| Activity score | "
+            f"{_format_activity_score(activity_metrics.score)} | "
+            f"{_format_average_activity_score(activity_metrics.avg_7d)} | "
+            f"{_format_average_activity_score(activity_metrics.avg_30d)} | "
+            f"{_trend_direction(activity_metrics.trend, activity_metrics.score, activity_metrics.avg_30d)} |"
+        ),
+        (
+            "| Walking distance | "
+            f"{walking_distance_km:.2f} km | "
+            f"{walking_metrics['avg_7d']} | "
+            f"{walking_metrics['avg_30d']} | "
+            f"{_trend_direction(walking_metrics['trend'], walking_distance_km, _walking_average_value(walking_metrics['avg_30d']))} |"
+        ),
+        (
+            "| Weight | "
+            f"{weight_metrics['current_weight']} | "
+            f"{weight_metrics['avg_7d']} | "
+            f"{weight_metrics['avg_30d']} | "
+            f"{_trend_direction(weight_metrics['trend'], _weight_value(weight_metrics['current_weight']), _weight_value(weight_metrics['avg_30d']))} |"
+        ),
+        "",
     ]
 
-    if walking_distance_km > 0 or walking_duration_min > 0:
-        lines.append(f"- Walking: {walking_distance_km:.2f} km / {walking_duration_min:.0f} min")
-        lines.append(f"- Walking trend: {walking_metrics['trend']}")
+    if body_rows:
+        lines.extend(["## Body", "", "| Metric | Value |", "| --- | --- |", *body_rows, ""])
+
+    if primary_today_activities:
+        lines.extend(_render_activity_sections(primary_today_activities, state.hevy_sets))
 
     lines.extend(
         [
-            f"- Current weight: {weight_metrics['current_weight']}",
-            f"- Weight trend: {weight_metrics['trend']}",
-        ]
-    )
-
-    if swimming_duration_min > 0:
-        lines.append(f"- Swimming: {swimming_duration_min:.0f} min")
-    if strength_activities:
-        lines.append(f"- Strength: {len(strength_activities)} workouts / {strength_duration_min:.0f} min")
-
-    lines.extend(
-        [
-            "",
-            "## Recovery",
-            "",
-            f"- Compatibility: {recovery_metrics.compatibility}",
-            f"- Fatigue risk: {recovery_metrics.fatigue_risk}",
-            f"- Recovery load score: {recovery_metrics.load_score:.1f}",
-            "- Main drivers:",
-            *[f"  - {driver}" for driver in recovery_metrics.drivers],
-            "- Suggested next day:",
-            *[f"  - {suggestion}" for suggestion in recovery_metrics.suggested_next_day],
-            "",
-            "## Trends",
-            "",
-            f"- 7-day avg Activity score: {_format_average_activity_score(activity_metrics.avg_7d)}",
-            f"- 30-day avg Activity score: {_format_average_activity_score(activity_metrics.avg_30d)}",
-        ]
-    )
-    if walking_distance_km > 0 or walking_duration_min > 0:
-        lines.extend(
-            [
-                f"- 7-day avg walking: {walking_metrics['avg_7d']}",
-                f"- 30-day avg walking: {walking_metrics['avg_30d']}",
-            ]
-        )
-    lines.extend(
-        [
-            f"- 7-day avg weight: {weight_metrics['avg_7d']}",
-            f"- 30-day avg weight: {weight_metrics['avg_30d']}",
-            "",
             "## Data Coverage",
             "",
             f"- Sources: {sources}",
-            f"- Activities: {len(primary_today_activities)}",
+            f"- Activity count: {len(primary_today_activities)}",
+            f"- Missing or partial data: {_missing_data_summary(withings_steps, measures, primary_today_activities)}",
             "",
-            "## Handoff",
+            "## Machine Handoff",
             "",
             _ai_handoff(
                 activities=primary_today_activities,
@@ -343,20 +520,410 @@ def _render_daily_state(state: DailyState) -> str:
             "",
         ]
     )
-
-    if primary_today_activities:
-        lines.extend(_render_activity_sections(primary_today_activities, state.hevy_sets))
-
-    if measures:
-        lines.extend(["## Body", ""])
-        for measure in measures:
-            lines.append(
-                "- "
-                f"{measure.get('type_name') or 'measurement'}: "
-                f"{measure.get('value') or '0.00'} {measure.get('unit') or ''}".rstrip()
-            )
-        lines.append("")
     return "\n".join(lines)
+
+
+def _snapshot_activity_status(activity_metrics: ActivityMetrics, *, separator: str = " · ") -> str:
+    return (
+        f"{activity_metrics.label}{separator}score {_format_activity_score(activity_metrics.score)}"
+        f"{separator}trend {activity_metrics.trend.lower()}"
+    )
+
+
+def _snapshot_recovery_status(recovery_metrics: RecoveryMetrics, *, separator: str = " · ") -> str:
+    return (
+        f"{recovery_metrics.compatibility}{separator}fatigue risk {recovery_metrics.fatigue_risk.lower()}"
+        f"{separator}load {recovery_metrics.load_score:.1f}"
+    )
+
+
+def _snapshot_movement_status(
+    withings_steps: int | None,
+    walking_distance_km: float,
+    ride_distance_km: float,
+    swimming_duration_min: float,
+    *,
+    formatted_steps: str | None = None,
+    separator: str = " · ",
+) -> str:
+    parts = [f"{formatted_steps or _format_step_count(withings_steps)} steps"]
+    if walking_distance_km > 0:
+        parts.append(f"{walking_distance_km:.2f} km walk")
+    if ride_distance_km > 0:
+        parts.append(f"{ride_distance_km:.2f} km ride")
+    if swimming_duration_min > 0:
+        parts.append(f"{swimming_duration_min:.0f} min swim")
+    return separator.join(parts)
+
+
+def _snapshot_strength_status(
+    strength_activities: list[NormalizedActivity],
+    hevy_sets: list[dict[str, str]],
+    *,
+    volume_formatter: Any | None = None,
+    separator: str = " · ",
+) -> str:
+    if not strength_activities:
+        return "None"
+
+    total_duration_min = sum(activity.duration_min for activity in strength_activities)
+    strength_sets = _sets_for_strength_activities(strength_activities, hevy_sets)
+    total_volume_kg = sum(_float_value(set_row.get("volume_kg", "")) for set_row in strength_sets)
+    workout_names = ", ".join(_display_activity_name(activity) for activity in strength_activities)
+    parts = [workout_names, f"{total_duration_min:.0f} min"]
+    if strength_sets:
+        volume_formatter = volume_formatter or _format_volume
+        parts.append(f"{len(strength_sets)} sets")
+        parts.append(volume_formatter(total_volume_kg))
+    return separator.join(parts)
+
+
+def _snapshot_body_status(weight_metrics: dict[str, str], *, separator: str = " · ") -> str:
+    return f"{weight_metrics['current_weight']}{separator}{weight_metrics['trend'].lower()}"
+
+
+def _render_section_title(console: Any, title: str) -> None:
+    console.print()
+    console.print(title, style="bold cyan")
+
+
+def _render_subsection_title(console: Any, title: str) -> None:
+    console.print()
+    console.print(f"  {title}", style="bold")
+
+
+def _render_kv_block(console: Any, rows: list[tuple[str, str]], *, indent: int = 0) -> None:
+    if not rows:
+        return
+    label_width = max(len(label) for label, _ in rows)
+    prefix = " " * indent
+    for label, value in rows:
+        value_width = max(console.width - indent - label_width - 2, 20)
+        wrapped_value = textwrap.fill(str(value), width=value_width).splitlines() or [""]
+        line = _styled_terminal_line(f"{prefix}{label:<{label_width}}  ", wrapped_value[0], label=label)
+        console.print(line)
+        continuation_prefix = f"{prefix}{'':<{label_width}}  "
+        for line in wrapped_value[1:]:
+            console.print(_styled_terminal_line(continuation_prefix, line, label=label))
+
+
+def _render_bullets(console: Any, items: list[str], *, indent: int = 0) -> None:
+    prefix = " " * indent
+    for item in items:
+        console.print(_styled_terminal_line(f"{prefix}• ", item))
+
+
+def _styled_terminal_line(prefix: str, value: str, *, label: str = "") -> Any:
+    from rich.text import Text
+
+    text = Text(prefix, style="bold white")
+    text.append(_styled_terminal_value(value, label=label))
+    return text
+
+
+def _styled_terminal_value(value: str, *, label: str = "") -> Any:
+    from rich.text import Text
+
+    text = Text(str(value))
+    plain = text.plain
+    if plain == "None":
+        text.stylize("dim italic")
+        return text
+    if label == "Metric":
+        text.stylize("bold white")
+        return text
+
+    _stylize_matches(text, r"\b\d[\d,]*(?:\.\d+)?(?:%| kg| km| min| steps|/day)?\b", "cyan")
+    _stylize_matches(text, r"\([+-]?\d+%\)", "cyan")
+    _stylize_matches(text, r"\b(Good|Low)\b", "green")
+    _stylize_matches(text, r"\bPoor\b", "bold red")
+    _stylize_matches(text, r"\bNear \d+d avg\b", "green")
+    _stylize_matches(text, r"\b(Above|Below) \d+d avg\b", "yellow")
+    _stylize_matches(text, r"\bNo baseline\b", "dim")
+    if label == "Fatigue risk" or label == "Recovery":
+        _stylize_matches(text, r"\b[Hh]igh\b", "yellow")
+    return text
+
+
+def _stylize_matches(text: Any, pattern: str, style: str) -> None:
+    for match in re.finditer(pattern, text.plain):
+        text.stylize(style, match.start(), match.end())
+
+
+def _render_wrapped_paragraph(console: Any, text: str, *, indent: int = 2, max_width: int = 88) -> None:
+    detected_width = console.size.width or shutil.get_terminal_size((100, 24)).columns
+    terminal_width = min(detected_width, max_width)
+    available_width = max(40, terminal_width - indent)
+    prefix = " " * indent
+    wrapped = textwrap.fill(
+        text,
+        width=available_width,
+        initial_indent=prefix,
+        subsequent_indent=prefix,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    console.print(wrapped, overflow="fold", crop=False, soft_wrap=False)
+
+
+def _render_terminal_activity_sections(
+    console: Any,
+    activities: list[NormalizedActivity],
+    hevy_sets: list[dict[str, str]],
+) -> None:
+    walking_activities = [activity for activity in activities if _is_walking_activity(activity)]
+    swimming_activities = [activity for activity in activities if activity.activity_type == "swim"]
+    workout_activities = [activity for activity in activities if activity.activity_type == "strength"]
+    other_activities = [
+        activity
+        for activity in activities
+        if activity not in [*walking_activities, *swimming_activities, *workout_activities]
+    ]
+
+    if walking_activities:
+        _render_subsection_title(console, "Walking")
+        _render_lines(console, [_terminal_distance_activity(activity) for activity in walking_activities], indent=4)
+
+    if swimming_activities:
+        _render_subsection_title(console, "Swimming")
+        _render_lines(console, [_terminal_duration_activity(activity) for activity in swimming_activities], indent=4)
+
+    if workout_activities:
+        _render_subsection_title(console, "Workout")
+        for activity in workout_activities:
+            console.print(_terminal_workout_header(activity))
+            workout_sets = [
+                set_row
+                for set_row in hevy_sets
+                if set_row.get("workout_source_id") == activity.source_id
+            ]
+            if workout_sets:
+                total_volume_kg = sum(_float_value(set_row.get("volume_kg", "")) for set_row in workout_sets)
+                _render_kv_block(
+                    console,
+                    [("Sets", str(len(workout_sets))), ("Volume", _format_terminal_volume(total_volume_kg))],
+                    indent=4,
+                )
+                _render_lines(console, _terminal_exercise_summaries(workout_sets), indent=4)
+
+    if other_activities:
+        _render_subsection_title(console, "Other")
+        _render_lines(console, [_terminal_distance_activity(activity) for activity in other_activities], indent=4)
+
+
+def _render_lines(console: Any, items: list[Any], *, indent: int = 0) -> None:
+    prefix = " " * indent
+    for item in items:
+        if hasattr(item, "plain"):
+            from rich.text import Text
+
+            line = Text(prefix)
+            line.append(item)
+            console.print(line)
+        else:
+            console.print(_styled_terminal_line(prefix, str(item)))
+
+
+def _terminal_distance_activity(activity: NormalizedActivity) -> Any:
+    from rich.text import Text
+
+    text = Text(activity.raw_type or "Unknown", style="bold")
+    text.append("  ")
+    text.append(_terminal_activity_source(activity), style="dim")
+    text.append(" / ")
+    text.append(_format_distance(activity.distance_km), style="cyan")
+    text.append(" / ")
+    text.append(f"{activity.duration_min:.0f} min", style="cyan")
+    return text
+
+
+def _terminal_duration_activity(activity: NormalizedActivity) -> Any:
+    from rich.text import Text
+
+    text = Text(activity.raw_type or "Unknown", style="bold")
+    text.append("  ")
+    text.append(_terminal_activity_source(activity), style="dim")
+    text.append(" / ")
+    text.append(f"{activity.duration_min:.0f} min", style="cyan")
+    return text
+
+
+def _terminal_workout_header(activity: NormalizedActivity) -> Any:
+    from rich.text import Text
+
+    text = Text("    ")
+    text.append(_display_activity_name(activity), style="bold")
+    text.append(" / ")
+    text.append(f"{activity.duration_min:.0f} min", style="cyan")
+    return text
+
+
+def _terminal_activity_source(activity: NormalizedActivity) -> str:
+    if activity.source_id:
+        return f"{activity.source}:{activity.source_id}"
+    return _display_activity_name(activity)
+
+
+def _terminal_exercise_summaries(sets: list[dict[str, str]]) -> list[str]:
+    by_exercise: dict[str, list[dict[str, str]]] = {}
+    for set_row in sets:
+        by_exercise.setdefault(set_row.get("exercise") or "Unknown exercise", []).append(set_row)
+
+    summaries: list[str] = []
+    for exercise, exercise_sets in by_exercise.items():
+        set_count = len(exercise_sets)
+        volume_kg = sum(_float_value(set_row.get("volume_kg", "")) for set_row in exercise_sets)
+        set_details = ", ".join(_format_set_detail(set_row) for set_row in exercise_sets)
+        summaries.append(f"{exercise}: {set_count} sets, {_format_terminal_volume(volume_kg)} ({set_details})")
+    return summaries
+
+
+def _format_terminal_step_count(value: int | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{value:,}"
+
+
+def _format_terminal_volume(value: float) -> str:
+    return f"{value:,.0f} kg" if value else "0 kg"
+
+
+def _format_terminal_driver(value: str) -> str:
+    return re.sub(r"\b(\d{4,})(?= kg\b)", lambda match: f"{int(match.group(1)):,}", value)
+
+
+def _trend_direction(trend: str, today: float | None, avg_30d: float | None) -> str:
+    if today is not None and avg_30d is not None:
+        difference = today - avg_30d
+        if abs(difference) < 0.1:
+            return "Stable"
+        if difference > 0:
+            return "Above 30-day average"
+        return "Below 30-day average"
+    if trend == "Increasing":
+        return "Slightly up"
+    if trend == "Decreasing":
+        return "Slightly down"
+    return trend
+
+
+def _terminal_trend_direction(today: float | None, avg_7d: float | None, avg_30d: float | None) -> str:
+    baseline = avg_30d if avg_30d not in {None, 0} else avg_7d
+    if today is None or baseline in {None, 0}:
+        return "No baseline"
+
+    label_suffix = "30d avg" if avg_30d not in {None, 0} else "7d avg"
+    percent_diff = ((today - baseline) / baseline) * 100
+    if abs(percent_diff) < 1:
+        return f"Near {label_suffix}"
+    if percent_diff > 0:
+        return f"Above {label_suffix} ({_format_percent_diff(percent_diff)})"
+    return f"Below {label_suffix} ({_format_percent_diff(percent_diff)})"
+
+
+def _format_percent_diff(value: float) -> str:
+    rounded = round(value)
+    if rounded > 0:
+        return f"+{rounded}%"
+    return f"{rounded}%"
+
+
+def _walking_average_value(value: str) -> float | None:
+    if value == "Unknown":
+        return None
+    return _float_value(value.split(" ", 1)[0])
+
+
+def _weight_value(value: str) -> float | None:
+    if value in {"Unknown", "No Withings weight available"}:
+        return None
+    return _float_value(value.split(" ", 1)[0])
+
+
+def _body_rows(measures: list[dict[str, str]]) -> list[str]:
+    return [f"| {label} | {value} |" for label, value in _body_kv_rows(measures)]
+
+
+def _terminal_body_kv_rows(measures: list[dict[str, str]]) -> list[tuple[str, str]]:
+    return [(label, value.replace(" · ", " / ")) for label, value in _body_kv_rows(measures)]
+
+
+def _body_kv_rows(measures: list[dict[str, str]]) -> list[tuple[str, str]]:
+    if not measures:
+        return []
+
+    latest_by_type = _latest_measures_by_type(measures)
+    main_types = {
+        "weight",
+        "fat_ratio",
+        "fat_mass_weight",
+        "muscle_mass",
+        "hydration",
+        "fat_free_mass",
+        "bone_mass",
+    }
+    rows = [
+        ("Weight", _measure_value(latest_by_type.get("weight"))),
+        ("Body fat", _body_fat_value(latest_by_type)),
+        ("Muscle mass", _measure_value(latest_by_type.get("muscle_mass"))),
+        ("Hydration", _measure_value(latest_by_type.get("hydration"))),
+        ("Fat-free mass", _measure_value(latest_by_type.get("fat_free_mass"))),
+        ("Bone mass", _measure_value(latest_by_type.get("bone_mass"))),
+    ]
+    for type_name, measure in latest_by_type.items():
+        if type_name not in main_types:
+            rows.append((type_name or "measurement", _measure_value(measure)))
+    return rows
+
+
+def _latest_measures_by_type(measures: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    latest: dict[str, dict[str, str]] = {}
+    for measure in measures:
+        type_name = measure.get("type_name", "")
+        current = latest.get(type_name)
+        if current is None or measure.get("datetime_local", "") >= current.get("datetime_local", ""):
+            latest[type_name] = measure
+    return latest
+
+
+def _measure_value(measure: dict[str, str] | None) -> str:
+    if measure is None:
+        return "Unknown"
+    return f"{measure.get('value') or '0.00'} {measure.get('unit') or ''}".rstrip()
+
+
+def _body_fat_value(measures: dict[str, dict[str, str]]) -> str:
+    fat_ratio = _measure_value(measures.get("fat_ratio"))
+    fat_mass = _measure_value(measures.get("fat_mass_weight"))
+    if fat_mass != "Unknown":
+        return f"{fat_ratio} · {fat_mass}"
+
+    weight = measures.get("weight")
+    ratio = measures.get("fat_ratio")
+    if weight is None or ratio is None:
+        return fat_ratio
+
+    fat_mass_value = _float_value(weight.get("value", "")) * _float_value(ratio.get("value", "")) / 100
+    if fat_mass_value <= 0:
+        return fat_ratio
+    return f"{fat_ratio} · {fat_mass_value:.2f} kg fat mass"
+
+
+def _missing_data_summary(
+    withings_steps: int | None,
+    measures: list[dict[str, str]],
+    activities: list[NormalizedActivity],
+) -> str:
+    missing: list[str] = []
+    if withings_steps is None:
+        missing.append("Withings steps unavailable")
+    if not measures:
+        missing.append("body measures unavailable")
+    if not activities:
+        missing.append("no activities logged")
+    if not missing:
+        return "None"
+    return "; ".join(missing)
 
 
 def _activity_level(total_distance_km: float, total_duration_min: float, activity_count: int) -> str:
@@ -626,6 +1193,7 @@ def _recovery_metrics(
             compatibility,
             strength_duration_min > 0,
             walking_distance_km > 0,
+            active_activity_types >= 2,
         ),
     )
 
@@ -687,43 +1255,37 @@ def _recovery_drivers(
 ) -> list[str]:
     drivers: list[str] = []
     if strength_duration_min > 0:
-        drivers.append(f"{strength_duration_min:.0f} min strength session")
-    if total_sets > 0:
-        drivers.append(f"{total_sets} total sets")
-    if total_volume_kg > 0:
-        drivers.append(f"{_format_volume(total_volume_kg)} strength volume")
-    if full_body:
-        drivers.append("full-body workout")
-    if exercise_count > 0:
-        drivers.append(f"{exercise_count} exercises")
+        strength_parts = [f"{strength_duration_min:.0f} min"]
+        if total_sets > 0:
+            strength_parts.append(f"{total_sets} sets")
+        if exercise_count > 0:
+            strength_parts.append(f"{exercise_count} exercises")
+        if total_volume_kg > 0:
+            strength_parts.append(_format_volume(total_volume_kg))
+        label = "Full-body strength" if full_body else "Strength"
+        drivers.append(f"{label}: {', '.join(strength_parts)}")
+    movement_parts: list[str] = []
     if walking_distance_km > 0:
-        drivers.append(f"{walking_distance_km:.2f} km walking")
-    if swimming_duration_min > 0:
-        drivers.append(f"{swimming_duration_min:.0f} min swimming")
+        movement_parts.append(f"{walking_distance_km:.2f} km walking")
     if ride_distance_km > 0:
-        drivers.append(f"{ride_distance_km:.2f} km cycling")
+        movement_parts.append(f"{ride_distance_km:.2f} km cycling")
     if run_distance_km > 0:
-        drivers.append(f"{run_distance_km:.2f} km running")
+        movement_parts.append(f"{run_distance_km:.2f} km running")
+    if swimming_duration_min > 0:
+        movement_parts.append(f"{swimming_duration_min:.0f} min swimming")
     if other_distance_km > 0:
-        drivers.append(f"{other_distance_km:.2f} km other activity distance")
+        movement_parts.append(f"{other_distance_km:.2f} km other activity")
+    if movement_parts:
+        drivers.append(f"Additional movement: {' + '.join(movement_parts)}")
     if mixed_activity:
-        drivers.append(
-            _mixed_activity_driver(
-                walking_distance_km,
-                swimming_duration_min,
-                strength_workout_count,
-                ride_distance_km,
-                run_distance_km,
-                other_distance_km,
-            )
-        )
+        drivers.append(f"Mixed load day: {_mixed_activity_driver(walking_distance_km, swimming_duration_min, strength_workout_count, ride_distance_km, run_distance_km, other_distance_km)}")
     if subjective_all_out:
-        drivers.append("subjective all-out effort noted")
+        drivers.append("Subjective all-out effort noted")
     if strength_details_missing:
-        drivers.append("strength details unavailable; score uses duration only")
+        drivers.append("Strength details unavailable; score uses duration only")
     if not drivers:
-        drivers.append("no activity load recorded")
-    return drivers
+        drivers.append("No activity load recorded")
+    return drivers[:5]
 
 
 def _mixed_activity_driver(
@@ -747,27 +1309,45 @@ def _mixed_activity_driver(
         activity_types.append("running")
     if other_distance_km > 0:
         activity_types.append("other")
-    return " + ".join(activity_types) + " same day"
+    return " + ".join(activity_types)
 
 
-def _recovery_suggestions(compatibility: str, strength_training: bool, walking_today: bool) -> list[str]:
+def _recovery_suggestions(
+    compatibility: str,
+    strength_training: bool,
+    walking_today: bool,
+    mixed_activity: bool,
+) -> list[str]:
     if compatibility == "Poor":
-        suggestions = ["avoid heavy full-body strength training", _light_movement_suggestion(walking_today)]
+        load_reason = (
+            "Recovery load is elevated due to strength volume plus additional movement"
+            if mixed_activity
+            else "Recovery load is elevated due to strength volume"
+        )
+        suggestions = [
+            "Avoid stacking another high-volume strength day",
+            _light_movement_suggestion(walking_today),
+            load_reason,
+        ]
     elif compatibility == "Caution":
-        suggestions = ["avoid stacking hard sessions", _light_movement_suggestion(walking_today)]
+        suggestions = [
+            "Avoid stacking hard sessions",
+            _light_movement_suggestion(walking_today),
+            "Recovery load is elevated relative to baseline",
+        ]
     elif compatibility == "Acceptable":
-        suggestions = ["keep next session moderate", "watch soreness and sleep quality"]
+        suggestions = ["Keep next session moderate", "Watch soreness and sleep quality"]
     else:
-        suggestions = ["normal activity is compatible with current load"]
-    if strength_training and "prioritize sleep and hydration" not in suggestions:
-        suggestions.append("prioritize sleep and hydration")
+        suggestions = ["Normal activity is compatible with current load"]
+    if strength_training and "Strength load present in current day" not in suggestions:
+        suggestions.append("Strength load present in current day")
     return suggestions
 
 
 def _light_movement_suggestion(walking_today: bool) -> str:
     if walking_today:
-        return "keep walking light if fatigue is high"
-    return "keep low-impact movement light if fatigue is high"
+        return "Treat long walking as optional if fatigue remains high"
+    return "Keep low-impact movement light if fatigue remains high"
 
 
 def _is_full_body_workout(activity: NormalizedActivity) -> bool:
@@ -964,7 +1544,7 @@ def _ai_handoff(
             else ""
         )
         activity_sentence = (
-            f"{activity_metrics.label} activity day with {len(activities)} primary activities"
+            f"{activity_metrics.label} activity day with {len(activities)} {_pluralize(len(activities), 'primary activity', 'primary activities')}"
             f"{walking_part}, {total_duration_min:.0f} min moving time, "
             f"and {withings_steps_text} Withings steps."
         )
@@ -978,7 +1558,7 @@ def _ai_handoff(
         else ""
     )
     strength_sentence = (
-        f" Strength training included {strength_count} workouts and {strength_duration_min:.0f} min."
+        f" Strength training included {strength_count} {_pluralize(strength_count, 'workout', 'workouts')} and {strength_duration_min:.0f} min."
         if strength_count > 0
         else ""
     )
@@ -993,6 +1573,10 @@ def _ai_handoff(
         f"Current weight is {weight_metrics['current_weight']}; "
         f"weight trend is {weight_metrics['trend']}."
     )
+
+
+def _pluralize(count: int, singular: str, plural: str) -> str:
+    return singular if count == 1 else plural
 
 
 def _walking_handoff_sentence(walking_distance_km: float, walking_metrics: dict[str, str]) -> str:

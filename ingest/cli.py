@@ -6,7 +6,9 @@ from pathlib import Path
 
 from ingest.config import AppConfig, load_config
 from ingest.context import (
+    build_daily_state,
     generate_daily_context,
+    render_daily_terminal_context,
 )
 from ingest.sources import hevy, withings
 
@@ -23,14 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="source", required=True)
 
     today_parser = subparsers.add_parser("today", help="Gather data and render context for today.")
-    _add_daily_sync_option(today_parser)
+    _add_daily_options(today_parser)
 
     day_parser = subparsers.add_parser("day", help="Gather data and render context for a date.")
     day_parser.add_argument("target_date", type=_date_arg, help="Target date in YYYY-MM-DD format.")
-    _add_daily_sync_option(day_parser)
+    _add_daily_options(day_parser)
 
     yesterday_parser = subparsers.add_parser("yesterday", help="Gather data and render context for yesterday.")
-    _add_daily_sync_option(yesterday_parser)
+    _add_daily_options(yesterday_parser)
 
     backfill_parser = subparsers.add_parser("backfill", help="Backfill historical data.")
     backfill_subparsers = backfill_parser.add_subparsers(dest="command", required=True)
@@ -126,15 +128,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.source == "today":
         target = date.today()
         _sync_for_daily_context(config, args.sync)
-        return _print_daily_context(config, target)
+        if args.markdown:
+            return _print_daily_context(config, target)
+        return _print_daily_terminal_context(config, target)
 
     if args.source == "day":
         _sync_for_daily_context(config, args.sync)
-        return _print_daily_context(config, args.target_date)
+        if args.markdown:
+            return _print_daily_context(config, args.target_date)
+        return _print_daily_terminal_context(config, args.target_date)
 
     if args.source == "yesterday":
         _sync_for_daily_context(config, args.sync)
-        return _print_daily_context(config, date.today() - timedelta(days=1))
+        target = date.today() - timedelta(days=1)
+        if args.markdown:
+            return _print_daily_context(config, target)
+        return _print_daily_terminal_context(config, target)
 
     parser.error("Unsupported command.")
     return 2
@@ -147,11 +156,16 @@ def _date_arg(value: str) -> date:
         raise argparse.ArgumentTypeError("date must be in YYYY-MM-DD format") from exc
 
 
-def _add_daily_sync_option(parser: argparse.ArgumentParser) -> None:
+def _add_daily_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sync",
         action="store_true",
         help="Run `ingest sync all` before rendering context.",
+    )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="Print Markdown instead of the terminal view.",
     )
 
 
@@ -167,6 +181,11 @@ def _sync_all(config: AppConfig) -> list[Path]:
 def _print_daily_context(config: AppConfig, target: date) -> int:
     path = generate_daily_context(config, target)
     print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def _print_daily_terminal_context(config: AppConfig, target: date) -> int:
+    render_daily_terminal_context(build_daily_state(config, target))
     return 0
 
 

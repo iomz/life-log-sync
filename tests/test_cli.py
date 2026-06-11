@@ -16,9 +16,12 @@ class CliTest(unittest.TestCase):
 
         today_args = parser.parse_args(["today"])
         today_sync_args = parser.parse_args(["today", "--sync"])
+        today_markdown_args = parser.parse_args(["today", "--markdown"])
         day_args = parser.parse_args(["day", "2026-06-02"])
         day_sync_args = parser.parse_args(["day", "2026-06-02", "--sync"])
+        day_markdown_args = parser.parse_args(["day", "2026-06-02", "--markdown"])
         yesterday_args = parser.parse_args(["yesterday"])
+        yesterday_markdown_args = parser.parse_args(["yesterday", "--markdown"])
         sync_args = parser.parse_args(["sync", "withings"])
         sync_hevy_args = parser.parse_args(["sync", "hevy"])
         sync_all_args = parser.parse_args(["sync", "all"])
@@ -30,11 +33,17 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(today_args.source, "today")
         self.assertFalse(today_args.sync)
+        self.assertFalse(today_args.markdown)
         self.assertTrue(today_sync_args.sync)
+        self.assertTrue(today_markdown_args.markdown)
         self.assertEqual(day_args.source, "day")
+        self.assertFalse(day_args.markdown)
         self.assertEqual(day_args.target_date.isoformat(), "2026-06-02")
         self.assertTrue(day_sync_args.sync)
+        self.assertTrue(day_markdown_args.markdown)
         self.assertEqual(yesterday_args.source, "yesterday")
+        self.assertFalse(yesterday_args.markdown)
+        self.assertTrue(yesterday_markdown_args.markdown)
         self.assertEqual(sync_args.source, "sync")
         self.assertEqual(sync_args.command, "withings")
         self.assertEqual(sync_hevy_args.source, "sync")
@@ -85,7 +94,7 @@ class CliTest(unittest.TestCase):
             self.assertIn("https://account.withings.com/oauth2_user/authorize2", output)
             self.assertIn("client_id=client", output)
 
-    def test_ingest_day_prints_generated_content_without_sync_when_data_exists(self) -> None:
+    def test_ingest_day_prints_terminal_content_without_sync_when_data_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_dir = root / "app-data"
@@ -133,10 +142,10 @@ class CliTest(unittest.TestCase):
             withings_sync.assert_not_called()
             output = stdout.getvalue()
             context_path = data_dir / "generated/daily_context.md"
-            self.assertTrue(output.startswith("# Physical Context - 2026-05-29\n"))
-            self.assertIn("# Physical Context - 2026-05-29", output)
-            self.assertIn("walk: withings:1", output)
-            self.assertEqual(output, context_path.read_text(encoding="utf-8"))
+            self.assertIn("Physical Context — 2026-05-29", output)
+            self.assertIn("Daily Snapshot", output)
+            self.assertIn("    walk  withings:1 / 1.00 km / 30 min", output)
+            self.assertFalse(context_path.exists())
 
     def test_ingest_day_does_not_sync_missing_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -203,9 +212,9 @@ class CliTest(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             withings_sync.assert_not_called()
-            self.assertIn("- Sources: Hevy", stdout.getvalue())
-            self.assertIn("### Workout", stdout.getvalue())
-            self.assertIn("- Push Day: 76 min", stdout.getvalue())
+            self.assertIn("Sources         Hevy", stdout.getvalue())
+            self.assertIn("Workout", stdout.getvalue())
+            self.assertIn("    Push Day / 76 min", stdout.getvalue())
             self.assertNotIn("unknown distance", stdout.getvalue())
 
     def test_import_hevy_writes_normalized_workouts(self) -> None:
@@ -301,7 +310,9 @@ class CliTest(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             withings_sync.assert_called_once()
             hevy_sync.assert_called_once()
-            self.assertIn("# Physical Context - 2026-05-29", stdout.getvalue())
+            self.assertIn("Physical Context — 2026-05-29", stdout.getvalue())
+            self.assertIn("Daily Snapshot", stdout.getvalue())
+            self.assertNotIn("# Physical Context - 2026-05-29", stdout.getvalue())
 
     def test_ingest_yesterday_uses_previous_day(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -346,7 +357,8 @@ class CliTest(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             withings_sync.assert_not_called()
-            self.assertIn("# Physical Context - 2026-06-02", stdout.getvalue())
+            self.assertIn("Physical Context — 2026-06-02", stdout.getvalue())
+            self.assertNotIn("# Physical Context - 2026-06-02", stdout.getvalue())
 
     def test_ingest_today_renders_without_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -391,6 +403,89 @@ class CliTest(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             withings_sync.assert_not_called()
+            output = stdout.getvalue()
+            self.assertIn("Physical Context — 2026-05-29", output)
+            self.assertIn("Daily Snapshot", output)
+            self.assertIn("Activity  Light / score 3.5 / trend unknown", output)
+            self.assertNotIn("·", output)
+            self.assertNotIn("| Area | Status |", output)
+
+    def test_ingest_today_markdown_prints_generated_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
+            withings_csv_path = data_dir / "withings/body_measures.csv"
+            withings_csv_path.parent.mkdir(parents=True)
+            withings_csv_path.write_text(
+                "\n".join(
+                    [
+                        "grpid,date,datetime_local,type,type_name,value,unit",
+                        "1,2026-05-29,2026-05-29T06:00:00,1,weight,70.50,kg",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            fake_date = mock.Mock()
+            fake_date.today.return_value = __import__("datetime").date(2026, 5, 29)
+            fake_date.fromisoformat = __import__("datetime").date.fromisoformat
+            stdout = io.StringIO()
+            with (
+                mock.patch("ingest.cli.date", fake_date),
+                mock.patch("ingest.cli.withings.sync") as withings_sync,
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(["--config", str(config_path), "today", "--markdown"])
+
+            self.assertEqual(exit_code, 0)
+            withings_sync.assert_not_called()
+            output = stdout.getvalue()
+            context_path = data_dir / "generated/daily_context.md"
+            self.assertTrue(output.startswith("# Physical Context - 2026-05-29\n"))
+            self.assertEqual(output, context_path.read_text(encoding="utf-8"))
+
+    def test_ingest_day_markdown_prints_generated_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(["--config", str(config_path), "day", "2026-05-29", "--markdown"])
+
+            self.assertEqual(exit_code, 0)
+            output = stdout.getvalue()
+            context_path = data_dir / "generated/daily_context.md"
+            self.assertTrue(output.startswith("# Physical Context - 2026-05-29\n"))
+            self.assertEqual(output, context_path.read_text(encoding="utf-8"))
+
+    def test_ingest_yesterday_markdown_prints_generated_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "app-data"
+            config_path = root / "ingest.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{data_dir}"\n', encoding="utf-8")
+
+            fake_date = mock.Mock()
+            fake_date.today.return_value = __import__("datetime").date(2026, 5, 30)
+            fake_date.fromisoformat = __import__("datetime").date.fromisoformat
+            stdout = io.StringIO()
+            with (
+                mock.patch("ingest.cli.date", fake_date),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(["--config", str(config_path), "yesterday", "--markdown"])
+
+            self.assertEqual(exit_code, 0)
+            output = stdout.getvalue()
+            context_path = data_dir / "generated/daily_context.md"
+            self.assertTrue(output.startswith("# Physical Context - 2026-05-29\n"))
+            self.assertEqual(output, context_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

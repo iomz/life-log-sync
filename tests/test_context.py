@@ -1,15 +1,63 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 
+from rich.console import Console
+
+from ingest.activities import normalize_withings_activity
 from ingest.config import load_config
-from ingest.context import generate_daily_context, render_daily_context, withings_activities_for_date
+from ingest.context import (
+    DailyState,
+    generate_daily_context,
+    render_daily_context,
+    render_daily_terminal_context,
+    withings_activities_for_date,
+)
 
 
 class ContextTest(unittest.TestCase):
+    def test_terminal_handoff_wraps_before_rich_printing(self) -> None:
+        activity = normalize_withings_activity(
+            {
+                "source_id": "walk",
+                "start_time": "2026-05-29T08:00:00",
+                "duration_min": "95.00",
+                "distance_km": "3.62",
+                "activity_type": "walk",
+                "raw_type": "walk",
+                "name": "Outdoor Walk",
+            }
+        )
+        state = DailyState(
+            target_date=date(2026, 5, 29),
+            activities=[activity],
+            measures=[
+                {"date": "2026-05-29", "datetime_local": "2026-05-29T06:00:00", "type_name": "weight", "value": "100.40", "unit": "kg"},
+            ],
+            withings_activity_summaries=[{"date": "2026-05-29", "step_count": "10006"}],
+            historical_withings_activity_summaries=[{"date": "2026-05-29", "step_count": "10006"}],
+            historical_activities=[activity],
+            historical_measures=[
+                {"date": "2026-05-29", "datetime_local": "2026-05-29T06:00:00", "type_name": "weight", "value": "100.40", "unit": "kg"},
+            ],
+            hevy_sets=[],
+        )
+        output = io.StringIO()
+        console = Console(file=output, width=140, color_system=None, force_terminal=False)
+
+        render_daily_terminal_context(state, console)
+
+        lines = output.getvalue().splitlines()
+        handoff_start = lines.index("Machine Handoff") + 1
+        handoff_lines = [line for line in lines[handoff_start:] if line]
+        self.assertGreater(len(handoff_lines), 1)
+        self.assertTrue(all(line.startswith("  ") for line in handoff_lines))
+        self.assertTrue(all(len(line) <= 88 for line in handoff_lines))
+
     def test_renders_activity_summary(self) -> None:
         content = render_daily_context(
             date(2026, 5, 29),
@@ -36,27 +84,21 @@ class ContextTest(unittest.TestCase):
         )
 
         self.assertIn("# Physical Context - 2026-05-29", content)
-        self.assertIn("## Summary", content)
-        self.assertIn("- Activity level: High", content)
-        self.assertIn("- Activity score: 31.8", content)
-        self.assertIn("- Activity trend: Unknown", content)
-        self.assertIn("- Recovery compatibility: Caution", content)
-        self.assertIn("- Withings steps: unavailable", content)
+        self.assertIn("## Daily Snapshot", content)
+        self.assertIn("| Activity | High · score 31.8 · trend unknown |", content)
+        self.assertIn("| Recovery | Caution · fatigue risk moderate · load 15.4 |", content)
+        self.assertIn("| Movement | unavailable steps", content)
         self.assertNotIn("- Walking: 0.00 km / 0 min", content)
-        self.assertNotIn("walking", content.lower())
-        self.assertIn("- Current weight: 70.50 kg", content)
-        self.assertIn("- 7-day avg weight: 70.50 kg", content)
-        self.assertIn("- 30-day avg weight: 70.50 kg", content)
-        self.assertIn("- Weight trend: Unknown", content)
-        self.assertIn("## Handoff", content)
+        self.assertIn("| Weight | 70.50 kg | 70.50 kg | 70.50 kg | Stable |", content)
+        self.assertIn("## Machine Handoff", content)
         self.assertIn(
             "High activity day with 2 primary activities, 75 min moving time, and unavailable Withings steps.",
             content,
         )
         self.assertIn("- Run: Morning Run (5.00 km, 30 min)", content)
         self.assertIn("## Body", content)
-        self.assertIn("- weight: 70.50 kg", content)
-        self.assertIn("- fat_ratio: 18.42 %", content)
+        self.assertIn("| Weight | 70.50 kg |", content)
+        self.assertIn("| Body fat | 18.42 % · 12.99 kg fat mass |", content)
         self.assertNotIn("Assumptions:", content)
         self.assertNotIn("Total swimming distance: 0.00 km", content)
 
@@ -74,14 +116,11 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Activity level: Light", content)
-        self.assertIn("- Activity score: 8.2", content)
-        self.assertIn("- Recovery compatibility: Good", content)
-        self.assertIn("- Withings steps: unavailable", content)
-        self.assertIn("- Walking: 4.00 km / 50 min", content)
-        self.assertIn("- 7-day avg walking: 0.57 km/day", content)
-        self.assertIn("- Walking trend: Unknown", content)
-        self.assertIn("- Current weight: No Withings weight available", content)
+        self.assertIn("| Activity | Light · score 8.2 · trend unknown |", content)
+        self.assertIn("| Recovery | Good · fatigue risk low · load 4.0 |", content)
+        self.assertIn("| Movement | unavailable steps · 4.00 km walk |", content)
+        self.assertIn("| Walking distance | 4.00 km | 0.57 km/day | 0.13 km/day | Above 30-day average |", content)
+        self.assertIn("| Body | No Withings weight available · unknown |", content)
         self.assertIn("- Recovery load score: 4.0", content)
 
     def test_renders_moderate_derived_metrics(self) -> None:
@@ -98,9 +137,8 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Activity level: Moderate", content)
-        self.assertIn("- Activity score: 12.6", content)
-        self.assertIn("- Recovery compatibility: Acceptable", content)
+        self.assertIn("| Activity | Moderate · score 12.6 · trend unknown |", content)
+        self.assertIn("| Recovery | Acceptable · fatigue risk low · load 10.0 |", content)
 
     def test_recovery_scores_high_walking_as_caution(self) -> None:
         content = render_daily_context(
@@ -116,7 +154,7 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Caution", content)
+        self.assertIn("- Compatibility: Caution", content)
         self.assertIn("- Fatigue risk: Moderate", content)
         self.assertIn("- Recovery load score: 15.0", content)
         self.assertIn("15.00 km walking", content)
@@ -124,10 +162,9 @@ class ContextTest(unittest.TestCase):
     def test_renders_none_derived_metrics_without_activities(self) -> None:
         content = render_daily_context(date(2026, 5, 29), [])
 
-        self.assertIn("- Activity level: None", content)
-        self.assertIn("- Activity score: unavailable", content)
-        self.assertIn("- Recovery compatibility: Good", content)
-        self.assertIn("- Withings steps: unavailable", content)
+        self.assertIn("| Activity | None · score unavailable · trend unknown |", content)
+        self.assertIn("| Recovery | Good · fatigue risk low · load 0.0 |", content)
+        self.assertIn("| Movement | unavailable steps |", content)
         self.assertNotIn("- Walking: 0.00 km / 0 min", content)
         self.assertNotIn("- Walking trend: Unknown", content)
         self.assertIn("No primary activities found for this date.", content)
@@ -156,12 +193,10 @@ class ContextTest(unittest.TestCase):
             historical_activities=historical_activities,
         )
 
-        self.assertIn("- 7-day avg walking: 2.00 km/day", content)
-        self.assertIn("- 30-day avg walking: 0.70 km/day", content)
-        self.assertIn("- 7-day avg Activity score: 4.0/day", content)
-        self.assertIn("- 30-day avg Activity score: 1.4/day", content)
-        self.assertIn("- Walking trend: Increasing", content)
-        self.assertIn("- Activity trend: Increasing", content)
+        self.assertIn("| Walking distance | 2.00 km | 2.00 km/day | 0.70 km/day | Above 30-day average |", content)
+        self.assertIn("| Activity score | 4.0 | 4.0/day | 1.4/day | Above 30-day average |", content)
+        self.assertIn("| Activity | Light · score 4.0 · trend increasing |", content)
+        self.assertIn("Walking trend is Increasing.", content)
 
     def test_renders_weight_trend_from_historical_measures(self) -> None:
         historical_measures = [
@@ -183,10 +218,8 @@ class ContextTest(unittest.TestCase):
 
         content = render_daily_context(date(2026, 5, 29), [], historical_measures, historical_measures)
 
-        self.assertIn("- Current weight: 71.00 kg", content)
-        self.assertIn("- 7-day avg weight: 71.00 kg", content)
-        self.assertIn("- 30-day avg weight: 71.50 kg", content)
-        self.assertIn("- Weight trend: Decreasing", content)
+        self.assertIn("| Weight | 71.00 kg | 71.00 kg | 71.50 kg | Below 30-day average |", content)
+        self.assertIn("| Body | 71.00 kg · decreasing |", content)
 
     def test_context_counts_withings_activities(self) -> None:
         content = render_daily_context(
@@ -214,7 +247,7 @@ class ContextTest(unittest.TestCase):
         )
 
         self.assertIn("- Sources: Withings", content)
-        self.assertIn("- Activities: 2", content)
+        self.assertIn("- Activity count: 2", content)
         self.assertIn("Outdoor Walk", content)
         self.assertIn("Duplicate Walk", content)
 
@@ -243,10 +276,8 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Activity level: Moderate", content)
-        self.assertIn("- Walking: 5.00 km / 60 min", content)
-        self.assertIn("- Activity score: 13.8", content)
-        self.assertIn("- Swimming: 45 min", content)
+        self.assertIn("| Activity | Moderate · score 13.8 · trend unknown |", content)
+        self.assertIn("| Movement | unavailable steps · 5.00 km walk · 45 min swim |", content)
         self.assertIn("Swimming included 45 min.", content)
         self.assertIn("- swim: Pool Swim (45 min)", content)
         self.assertNotIn("1.20 km", content)
@@ -267,9 +298,9 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Activity level: Moderate", content)
-        self.assertIn("- Strength: 1 workouts / 93 min", content)
-        self.assertIn("Strength training included 1 workouts and 93 min.", content)
+        self.assertIn("| Activity | Moderate · score 7.8 · trend unknown |", content)
+        self.assertIn("| Strength | Push Day · 93 min |", content)
+        self.assertIn("Strength training included 1 workout and 93 min.", content)
         self.assertIn("### Workout", content)
         self.assertIn("- Push Day: 93 min", content)
         self.assertNotIn("unknown distance", content)
@@ -298,12 +329,9 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Poor", content)
+        self.assertIn("- Compatibility: Poor", content)
         self.assertIn("- Fatigue risk: High", content)
-        self.assertIn("94 min strength session", content)
-        self.assertIn("69 total sets", content)
-        self.assertIn("34551 kg strength volume", content)
-        self.assertIn("full-body workout", content)
+        self.assertIn("Full-body strength: 94 min, 69 sets, 69 exercises, 34551 kg", content)
 
     def test_recovery_scores_mixed_walking_and_strength_as_poor(self) -> None:
         content = render_daily_context(
@@ -338,10 +366,10 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Poor", content)
+        self.assertIn("- Compatibility: Poor", content)
         self.assertIn("- Fatigue risk: High", content)
         self.assertIn("- Recovery load score: 39.0", content)
-        self.assertIn("walking + strength same day", content)
+        self.assertIn("Mixed load day: walking + strength", content)
 
     def test_recovery_scores_cycling_and_strength_as_mixed_load(self) -> None:
         content = render_daily_context(
@@ -371,10 +399,10 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Caution", content)
+        self.assertIn("- Compatibility: Caution", content)
         self.assertIn("- Recovery load score: 19.8", content)
-        self.assertIn("20.00 km cycling", content)
-        self.assertIn("strength + cycling same day", content)
+        self.assertIn("Additional movement: 20.00 km cycling", content)
+        self.assertIn("Mixed load day: strength + cycling", content)
         self.assertNotIn("walking + strength", content)
 
     def test_recovery_scores_swimming_and_walking_as_caution(self) -> None:
@@ -401,10 +429,10 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Caution", content)
+        self.assertIn("- Compatibility: Caution", content)
         self.assertIn("- Fatigue risk: Moderate", content)
         self.assertIn("- Recovery load score: 15.2", content)
-        self.assertIn("walking + swimming same day", content)
+        self.assertIn("Mixed load day: walking + swimming", content)
 
     def test_subjective_all_out_note_downgrades_recovery(self) -> None:
         content = render_daily_context(
@@ -426,9 +454,9 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Poor", content)
+        self.assertIn("- Compatibility: Poor", content)
         self.assertIn("- Fatigue risk: High", content)
-        self.assertIn("subjective all-out effort noted", content)
+        self.assertIn("Subjective all-out effort noted", content)
 
     def test_recovery_handles_missing_workout_set_data(self) -> None:
         content = render_daily_context(
@@ -445,8 +473,8 @@ class ContextTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("- Recovery compatibility: Good", content)
-        self.assertIn("strength details unavailable; score uses duration only", content)
+        self.assertIn("- Compatibility: Good", content)
+        self.assertIn("Strength details unavailable; score uses duration only", content)
 
     def test_translates_known_japanese_activity_names_for_display(self) -> None:
         content = render_daily_context(
@@ -529,12 +557,11 @@ class ContextTest(unittest.TestCase):
             self.assertIn("withings:w1", content)
             self.assertIn("withings:w2", content)
             self.assertIn("- Sources: Withings", content)
-            self.assertIn("- Activities: 2", content)
-            self.assertIn("- Withings steps: 3456", content)
-            self.assertIn("- Walking: 2.10 km / 26 min", content)
-            self.assertIn("- 7-day avg walking: 1.30 km/day", content)
+            self.assertIn("- Activity count: 2", content)
+            self.assertIn("| Movement | 3456 steps · 2.10 km walk |", content)
+            self.assertIn("| Walking distance | 2.10 km | 1.30 km/day | 0.30 km/day | Above 30-day average |", content)
             self.assertNotIn("withings:w0", content)
-            self.assertIn("- weight: 70.50 kg", content)
+            self.assertIn("| Weight | 70.50 kg |", content)
             self.assertNotIn("71.00", content)
 
     def test_renders_zero_withings_steps_when_daily_activity_row_is_zero(self) -> None:
@@ -544,7 +571,7 @@ class ContextTest(unittest.TestCase):
             withings_activity_summaries=[{"date": "2026-05-29", "step_count": "0"}],
         )
 
-        self.assertIn("- Withings steps: 0", content)
+        self.assertIn("| Movement | 0 steps |", content)
 
     def test_activity_score_uses_steps_when_no_workout_is_logged(self) -> None:
         content = render_daily_context(
@@ -553,9 +580,8 @@ class ContextTest(unittest.TestCase):
             withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6500"}],
         )
 
-        self.assertIn("- Activity level: Light", content)
-        self.assertIn("- Activity score: 10.0", content)
-        self.assertIn("- Withings steps: 6500", content)
+        self.assertIn("| Activity | Light · score 10.0 · trend unknown |", content)
+        self.assertIn("| Movement | 6500 steps |", content)
 
     def test_activity_score_does_not_double_count_walk_steps(self) -> None:
         content = render_daily_context(
@@ -573,7 +599,7 @@ class ContextTest(unittest.TestCase):
             withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6500"}],
         )
 
-        self.assertIn("- Activity score: 10.0", content)
+        self.assertIn("| Activity | Light · score 10.0 · trend unknown |", content)
 
     def test_activity_score_estimates_logged_run_steps_when_missing(self) -> None:
         content = render_daily_context(
@@ -590,7 +616,7 @@ class ContextTest(unittest.TestCase):
             withings_activity_summaries=[{"date": "2026-05-29", "step_count": "6000"}],
         )
 
-        self.assertIn("- Activity score: 7.5", content)
+        self.assertIn("| Activity | Light · score 7.5 · trend unknown |", content)
 
     def test_handles_missing_withings_workouts_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
